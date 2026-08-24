@@ -11,6 +11,7 @@ export interface TravelPlace {
   continent?: string;
   originalIndex: number;
   journeyIndex: number;
+  visitedAt?: string;
 }
 
 export type ImportIssueCode = "missing_coordinates" | "invalid_coordinates";
