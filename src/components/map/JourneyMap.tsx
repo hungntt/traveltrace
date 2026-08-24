@@ -67,17 +67,13 @@ function createTravelerElement(): { container: HTMLDivElement; pointer: HTMLElem
   return { container, pointer };
 }
 
-// Safe Stop custom HTML marker (No HTML injection)
+// Clean, minimal destination dot HTML marker (no visible numbers)
 function createStopMarkerElement(stopNumber: number, placeName: string): HTMLDivElement {
   const el = document.createElement("div");
   el.className = "journey-stop-marker";
   el.dataset.stop = String(stopNumber);
-  el.title = `${stopNumber}. ${placeName}`;
-
-  const numSpan = document.createElement("span");
-  numSpan.className = "marker-number";
-  numSpan.textContent = String(stopNumber);
-  el.appendChild(numSpan);
+  el.setAttribute("aria-label", placeName);
+  el.title = placeName;
 
   return el;
 }
@@ -86,11 +82,6 @@ function createStopMarkerElement(stopNumber: number, placeName: string): HTMLDiv
 function createStopPopupContent(stopNum: number, place: TravelPlace): HTMLElement {
   const card = document.createElement("div");
   card.className = "map-popup-card";
-
-  const tag = document.createElement("span");
-  tag.className = "popup-stop-tag";
-  tag.textContent = `Stop ${stopNum}`;
-  card.appendChild(tag);
 
   const title = document.createElement("strong");
   title.className = "popup-title";
@@ -132,9 +123,7 @@ export function JourneyMap() {
   const mapRef = useRef<MapLibreMap | null>(null);
   const travelerMarkerRef = useRef<Marker | null>(null);
   const travelerPointerRef = useRef<HTMLElement | null>(null);
-  const stopMarkersRef = useRef<{ marker: Marker; element: HTMLDivElement }[]>([]);
-
-  // Animation and lifecycle tracking refs
+  const stopMarkersRef = useRef<{ marker: Marker; element: HTMLDivElement }[]>([])  // Animation and lifecycle tracking refs
   const animationFrameRef = useRef<number | null>(null);
   const lastTimestampRef = useRef<number | null>(null);
   const progressRef = useRef(0);
@@ -142,6 +131,10 @@ export function JourneyMap() {
   const speedRef = useRef(1);
   const pauseRemainingMsRef = useRef(0);
   const lastCameraSegmentRef = useRef<number | null>(null);
+  const lastCompletedSegmentRef = useRef<number>(-1);
+  const lastActiveUpdateTimestampRef = useRef<number>(0);
+  const lastUiSyncRef = useRef<number>(0);
+  const lastDiagnosticLogRef = useRef<number>(0);
   const userInteractedRef = useRef(false);
   const initTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isFallbackRef = useRef(false);
@@ -181,22 +174,25 @@ export function JourneyMap() {
     return calculateTotalRouteDistance(places);
   }, [places]);
 
-  // Current traveler status
+  // Current traveler status (for UI controls)
   const travelerState = useMemo(() => {
     return getTravelerState(places, progress, preparedSegments);
   }, [places, progress, preparedSegments]);
 
   // Update route layers, traveler marker, bearing orientation, and stop marker states.
   // Returns true if visual objects exist and were successfully updated.
-  const updateMapVisuals = (currentProg: number): boolean => {
+  const updateMapVisuals = (
+    currentProg: number,
+    options?: { updateActive?: boolean; forceCompleted?: boolean }
+  ): boolean => {
     const map = mapRef.current;
     if (!map || places.length === 0) return false;
 
-    // 1. Calculate traveler state
+    // 1. Calculate traveler state (uses precomputed samples, zero Turf)
     const state = getTravelerState(places, currentProg, preparedSegments);
     if (!state) return false;
 
-    // 2. Update traveler marker position & bearing
+    // 2. Update traveler marker position & bearing (every frame)
     if (travelerMarkerRef.current) {
       travelerMarkerRef.current.setLngLat(state.position);
       if (travelerPointerRef.current) {
@@ -206,12 +202,7 @@ export function JourneyMap() {
       return false;
     }
 
-    // 3. Update GeoJSON route sources
-    const { completedGeoJson, activeGeoJson } = buildOptimizedProgressRoute(
-      preparedSegments,
-      currentProg
-    );
-
+    // 3. Verify GeoJSON route sources exist
     const completedSource = map.getSource("completed-route") as GeoJSONSource | undefined;
     const activeSource = map.getSource("active-segment") as GeoJSONSource | undefined;
 
@@ -219,10 +210,29 @@ export function JourneyMap() {
       return false;
     }
 
-    completedSource.setData(completedGeoJson);
-    activeSource.setData(activeGeoJson);
+    // 4. Update route layers using precomputed segment geometry
+    const { completedGeoJson, activeGeoJson } = buildOptimizedProgressRoute(
+      preparedSegments,
+      currentProg
+    );
 
-    // 4. Update stop marker classes with correct arrival semantics
+    const completedUntil = Math.floor(currentProg);
+    const needCompletedUpdate =
+      options?.forceCompleted ||
+      completedUntil !== lastCompletedSegmentRef.current ||
+      currentProg >= places.length - 1 ||
+      currentProg === 0;
+
+    if (needCompletedUpdate) {
+      completedSource.setData(completedGeoJson);
+      lastCompletedSegmentRef.current = completedUntil;
+    }
+
+    if (options?.updateActive !== false) {
+      activeSource.setData(activeGeoJson);
+    }
+
+    // 6. Update stop marker classes with correct arrival semantics
     const isTransit = state.isTransit;
     const departedIdx = state.departedStopIndex;
     const destIdx = state.destinationStopIndex;
@@ -230,7 +240,6 @@ export function JourneyMap() {
     const isFinal = currentProg >= places.length - 1;
 
     stopMarkersRef.current.forEach(({ element }, idx) => {
-      // Completed: stops that have been fully arrived at
       const isCompleted = isFinal
         ? true
         : isTransit
@@ -243,14 +252,12 @@ export function JourneyMap() {
         element.classList.remove("completed");
       }
 
-      // Target destination (while traveling in transit)
       if (isTransit && idx === destIdx) {
         element.classList.add("target-destination");
       } else {
         element.classList.remove("target-destination");
       }
 
-      // Arrived active stop (stationary at exact destination)
       if (!isTransit && idx === arrivedIdx) {
         element.classList.add("active");
       } else {
@@ -258,146 +265,178 @@ export function JourneyMap() {
       }
     });
 
-    // Request immediate map render refresh
-    map.triggerRepaint();
-
     return true;
   };
 
-  // Guarded helper to initialize TravelTrace GeoJSON sources, layers, and markers
-  const initializeJourneyLayers = (map: MapLibreMap, currentPlaces: TravelPlace[]) => {
-    if (!map.isStyleLoaded() || currentPlaces.length === 0) return;
+  // Guarded helper to initialize TravelTrace GeoJSON sources, layers, and markers.
+  // Returns true only when all sources, layers, markers, and initial visuals are verified ready.
+  const initializeJourneyLayers = (
+    map: MapLibreMap,
+    currentPlaces: TravelPlace[]
+  ): boolean => {
+    if (!map || currentPlaces.length === 0) return false;
 
-    // 1. Add Future / Full Route Line Layer
-    const fullRouteGeoJson = buildFullRouteFeatureCollection(currentPlaces);
-    if (!map.getSource("full-route")) {
-      map.addSource("full-route", {
-        type: "geojson",
-        data: fullRouteGeoJson,
+    try {
+      // 1. Add Future / Full Route Line Layer (static during playback)
+      const fullRouteGeoJson = buildFullRouteFeatureCollection(currentPlaces);
+      if (!map.getSource("full-route")) {
+        map.addSource("full-route", {
+          type: "geojson",
+          data: fullRouteGeoJson,
+        });
+      } else {
+        (map.getSource("full-route") as GeoJSONSource).setData(fullRouteGeoJson);
+      }
+
+      if (!map.getLayer("full-route-casing")) {
+        map.addLayer({
+          id: "full-route-casing",
+          type: "line",
+          source: "full-route",
+          paint: {
+            "line-color": "#8fa898",
+            "line-width": 2.5,
+            "line-opacity": 0.5,
+            "line-dasharray": [2, 2],
+          },
+        });
+      }
+
+      // 2. Add Completed Route Layer
+      if (!map.getSource("completed-route")) {
+        map.addSource("completed-route", {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+      }
+
+      if (!map.getLayer("completed-route-line")) {
+        map.addLayer({
+          id: "completed-route-line",
+          type: "line",
+          source: "completed-route",
+          paint: {
+            "line-color": "#1f6249", // TravelTrace dark green
+            "line-width": 4,
+            "line-opacity": 0.95,
+          },
+          layout: {
+            "line-cap": "round",
+            "line-join": "round",
+          },
+        });
+      }
+
+      // 3. Add Active Segment Layer
+      if (!map.getSource("active-segment")) {
+        map.addSource("active-segment", {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+      }
+
+      if (!map.getLayer("active-segment-line")) {
+        map.addLayer({
+          id: "active-segment-line",
+          type: "line",
+          source: "active-segment",
+          paint: {
+            "line-color": "#df7443", // TravelTrace orange
+            "line-width": 4.5,
+            "line-opacity": 0.98,
+          },
+          layout: {
+            "line-cap": "round",
+            "line-join": "round",
+          },
+        });
+      }
+
+      // Ensure active line layer sits on top
+      if (map.getLayer("active-segment-line")) {
+        map.moveLayer("active-segment-line");
+      }
+
+      // 4. Add Destination Dot Markers with Safe Popups
+      stopMarkersRef.current.forEach(({ marker }) => marker.remove());
+      stopMarkersRef.current = currentPlaces.map((place, idx) => {
+        const stopNum = idx + 1;
+        const el = createStopMarkerElement(stopNum, place.name);
+
+        const popup = new Popup({
+          offset: 12,
+          closeButton: false,
+          className: "custom-map-popup",
+        }).setDOMContent(createStopPopupContent(stopNum, place));
+
+        const marker = new Marker({ element: el })
+          .setLngLat([place.longitude, place.latitude])
+          .setPopup(popup)
+          .addTo(map);
+
+        el.addEventListener("click", () => {
+          userInteractedRef.current = false;
+          seekTo(idx);
+        });
+
+        return { marker, element: el };
       });
-    } else {
-      (map.getSource("full-route") as GeoJSONSource).setData(fullRouteGeoJson);
-    }
 
-    if (!map.getLayer("full-route-casing")) {
-      map.addLayer({
-        id: "full-route-casing",
-        type: "line",
-        source: "full-route",
-        paint: {
-          "line-color": "#8fa898",
-          "line-width": 2.5,
-          "line-opacity": 0.45,
-          "line-dasharray": [2, 2],
-        },
-      });
-    }
+      // 5. Add Directional Traveler Marker with Subpixel Positioning
+      travelerMarkerRef.current?.remove();
+      const { container: travelerEl, pointer: travelerPointer } = createTravelerElement();
+      const initialPos: [number, number] = [
+        currentPlaces[0].longitude,
+        currentPlaces[0].latitude,
+      ];
 
-    // 2. Add Completed Route Layer
-    if (!map.getSource("completed-route")) {
-      map.addSource("completed-route", {
-        type: "geojson",
-        data: { type: "FeatureCollection", features: [] },
-      });
-    }
-
-    if (!map.getLayer("completed-route-line")) {
-      map.addLayer({
-        id: "completed-route-line",
-        type: "line",
-        source: "completed-route",
-        paint: {
-          "line-color": "#1f6249", // TravelTrace dark green
-          "line-width": 3.5,
-          "line-opacity": 0.9,
-        },
-        layout: {
-          "line-cap": "round",
-          "line-join": "round",
-        },
-      });
-    }
-
-    // 3. Add Active Segment Layer
-    if (!map.getSource("active-segment")) {
-      map.addSource("active-segment", {
-        type: "geojson",
-        data: { type: "FeatureCollection", features: [] },
-      });
-    }
-
-    if (!map.getLayer("active-segment-line")) {
-      map.addLayer({
-        id: "active-segment-line",
-        type: "line",
-        source: "active-segment",
-        paint: {
-          "line-color": "#df7443", // TravelTrace orange
-          "line-width": 4.5,
-          "line-opacity": 0.95,
-        },
-        layout: {
-          "line-cap": "round",
-          "line-join": "round",
-        },
-      });
-    }
-
-    // Ensure active line layer sits on top
-    if (map.getLayer("active-segment-line")) {
-      map.moveLayer("active-segment-line");
-    }
-
-    // 4. Add Numbered Stop Markers with Safe Popups
-    stopMarkersRef.current.forEach(({ marker }) => marker.remove());
-    stopMarkersRef.current = currentPlaces.map((place, idx) => {
-      const stopNum = idx + 1;
-      const el = createStopMarkerElement(stopNum, place.name);
-
-      const popup = new Popup({
-        offset: 16,
-        closeButton: false,
-        className: "custom-map-popup",
-      }).setDOMContent(createStopPopupContent(stopNum, place));
-
-      const marker = new Marker({ element: el })
-        .setLngLat([place.longitude, place.latitude])
-        .setPopup(popup)
-        .addTo(map);
-
-      el.addEventListener("click", () => {
-        userInteractedRef.current = false;
-        seekTo(idx);
+      const travelerMarker = new Marker({
+        element: travelerEl,
+        anchor: "center",
       });
 
-      return { marker, element: el };
-    });
+      if (
+        typeof (
+          travelerMarker as unknown as {
+            setSubpixelPositioning?: (v: boolean) => Marker;
+          }
+        ).setSubpixelPositioning === "function"
+      ) {
+        (
+          travelerMarker as unknown as {
+            setSubpixelPositioning: (v: boolean) => Marker;
+          }
+        ).setSubpixelPositioning(true);
+      }
 
-    // 5. Add Directional Traveler Marker with Subpixel Positioning
-    travelerMarkerRef.current?.remove();
-    const { container: travelerEl, pointer: travelerPointer } = createTravelerElement();
-    const initialPos: [number, number] = [
-      currentPlaces[0].longitude,
-      currentPlaces[0].latitude,
-    ];
+      travelerMarker.setLngLat(initialPos).addTo(map);
 
-    const travelerMarker = new Marker({
-      element: travelerEl,
-      anchor: "center",
-    });
+      travelerMarkerRef.current = travelerMarker;
+      travelerPointerRef.current = travelerPointer;
 
-    if (typeof (travelerMarker as unknown as { setSubpixelPositioning?: (v: boolean) => Marker }).setSubpixelPositioning === "function") {
-      (travelerMarker as unknown as { setSubpixelPositioning: (v: boolean) => Marker }).setSubpixelPositioning(true);
+      // Verify ALL required sources, markers, and initial visual state exist
+      const hasFullRoute = Boolean(map.getSource("full-route"));
+      const hasCompletedRoute = Boolean(map.getSource("completed-route"));
+      const hasActiveSegment = Boolean(map.getSource("active-segment"));
+      const hasTraveler = Boolean(travelerMarkerRef.current);
+      const hasAllStops = stopMarkersRef.current.length === currentPlaces.length;
+
+      if (!hasFullRoute || !hasCompletedRoute || !hasActiveSegment || !hasTraveler || !hasAllStops) {
+        console.warn("[TravelTrace map] Layer initialization incomplete - missing source/marker.");
+        return false;
+      }
+
+      // Initial visual sync
+      const visualUpdated = updateMapVisuals(progressRef.current, {
+        updateActive: true,
+        forceCompleted: true,
+      });
+
+      return visualUpdated;
+    } catch (err) {
+      console.error("[TravelTrace map] Failed to initialize journey layers:", err);
+      return false;
     }
-
-    travelerMarker.setLngLat(initialPos).addTo(map);
-
-    travelerMarkerRef.current = travelerMarker;
-    travelerPointerRef.current = travelerPointer;
-
-    // Update initial visuals and mark animation readiness
-    updateMapVisuals(progressRef.current);
-    setAnimationReady(true);
   };
 
   // Initialize MapLibre GL instance
@@ -411,6 +450,7 @@ export function JourneyMap() {
     setMapErrorMessage(null);
     userInteractedRef.current = false;
     lastCameraSegmentRef.current = null;
+    lastCompletedSegmentRef.current = -1;
 
     const bounds = getJourneyBounds(places);
 
@@ -458,11 +498,17 @@ export function JourneyMap() {
         initTimeoutRef.current = null;
       }
       try {
-        initializeJourneyLayers(map, places);
-        setMapStatus("ready");
-        requestAnimationFrame(() => {
-          map.resize();
-        });
+        const ready = initializeJourneyLayers(map, places);
+        if (ready) {
+          setAnimationReady(true);
+          setMapStatus("ready");
+          requestAnimationFrame(() => {
+            map.resize();
+          });
+        } else {
+          setAnimationReady(false);
+          console.warn("[TravelTrace map] Layer initialization returned false after style load.");
+        }
       } catch (layerErr) {
         console.error("[TravelTrace map] Error initializing journey layers:", layerErr);
         setMapStatus("error");
@@ -561,7 +607,7 @@ export function JourneyMap() {
       map.fitBounds(segmentBounds, {
         padding: { top: 90, bottom: 100, left: 80, right: 80 },
         maxZoom: 10,
-        duration: Math.round(1200 / speedRef.current),
+        duration: Math.round(700 / speedRef.current),
         essential: false,
       });
     }
@@ -583,12 +629,13 @@ export function JourneyMap() {
       progressRef.current = 0;
       setProgress(0);
       lastCameraSegmentRef.current = null;
+      lastCompletedSegmentRef.current = -1;
       userInteractedRef.current = false;
     }
 
-    // Segment flight duration in milliseconds at 1x speed
-    const BASE_SEGMENT_DURATION_MS = 3800;
-    const STOP_PAUSE_DURATION_MS = 800;
+    // Fast, energetic flight duration: ~1.8s per segment at 1x speed
+    const BASE_SEGMENT_DURATION_MS = 1800;
+    const STOP_PAUSE_DURATION_MS = 200;
 
     const animate = (timestamp: number) => {
       if (!isPlayingRef.current) return;
@@ -617,26 +664,54 @@ export function JourneyMap() {
       if (nextStopFloor > prevStopFloor && nextStopFloor < places.length) {
         nextProgress = nextStopFloor;
         pauseRemainingMsRef.current = STOP_PAUSE_DURATION_MS / speedRef.current;
+        progressRef.current = nextProgress;
+        updateMapVisuals(nextProgress, { updateActive: true, forceCompleted: true });
+        updateCameraForProgress(nextProgress);
+        setProgress(nextProgress); // Immediate sync at stop
+        animationFrameRef.current = requestAnimationFrame(animate);
+        return;
       }
 
       if (nextProgress >= maxProg) {
         nextProgress = maxProg;
         progressRef.current = nextProgress;
-        const visualUpdated = updateMapVisuals(nextProgress);
-        if (visualUpdated) {
-          setProgress(nextProgress);
-        }
+        updateMapVisuals(nextProgress, { updateActive: true, forceCompleted: true });
+        setProgress(nextProgress); // Immediate sync on journey end
         setIsPlaying(false);
         isPlayingRef.current = false;
         return;
       }
 
       progressRef.current = nextProgress;
-      const visualUpdated = updateMapVisuals(nextProgress);
-      if (visualUpdated) {
-        setProgress(nextProgress);
-      }
+
+      // Update traveler marker, bearing, stop states, and growing active orange route smoothly every frame
+      updateMapVisuals(nextProgress, {
+        updateActive: true,
+        forceCompleted: false,
+      });
+
       updateCameraForProgress(nextProgress);
+
+      // Throttle React progress updates to ~10 FPS (100ms)
+      if (timestamp - lastUiSyncRef.current >= 100) {
+        setProgress(nextProgress);
+        lastUiSyncRef.current = timestamp;
+      }
+
+      // Dev-only diagnostic logging (max once per second)
+      if (process.env.NODE_ENV !== "production" && timestamp - lastDiagnosticLogRef.current >= 1000) {
+        lastDiagnosticLogRef.current = timestamp;
+        console.debug("[TravelTrace Animation Diagnostic]", {
+          progressRef: progressRef.current,
+          reactProgress: progressRef.current,
+          animationReady,
+          travelerPosition: travelerMarkerRef.current?.getLngLat(),
+          activeSourceExists: Boolean(mapRef.current?.getSource("active-segment")),
+          completedSourceExists: Boolean(mapRef.current?.getSource("completed-route")),
+          mapLoaded: mapRef.current?.loaded(),
+          styleLoaded: mapRef.current?.isStyleLoaded(),
+        });
+      }
 
       animationFrameRef.current = requestAnimationFrame(animate);
     };
@@ -666,8 +741,9 @@ export function JourneyMap() {
     setProgress(0);
     pauseRemainingMsRef.current = 0;
     lastCameraSegmentRef.current = null;
+    lastCompletedSegmentRef.current = -1;
     userInteractedRef.current = false;
-    updateMapVisuals(0);
+    updateMapVisuals(0, { updateActive: true, forceCompleted: true });
     fitWholeJourney();
     if (places.length > 1 && animationReady) {
       setIsPlaying(true);
@@ -677,7 +753,7 @@ export function JourneyMap() {
   const handlePrev = () => {
     setIsPlaying(false);
     userInteractedRef.current = false;
-    const prevStop = Math.max(0, Math.floor(progress - 0.05));
+    const prevStop = Math.max(0, Math.floor(progressRef.current - 0.05));
     seekTo(prevStop);
   };
 
@@ -685,7 +761,7 @@ export function JourneyMap() {
     setIsPlaying(false);
     userInteractedRef.current = false;
     const maxProg = Math.max(0, places.length - 1);
-    const nextStop = Math.min(maxProg, Math.floor(progress + 1.05));
+    const nextStop = Math.min(maxProg, Math.floor(progressRef.current + 1.05));
     seekTo(nextStop);
   };
 
@@ -696,15 +772,7 @@ export function JourneyMap() {
     setProgress(clamped);
     pauseRemainingMsRef.current = 0;
     lastCameraSegmentRef.current = null;
-    updateMapVisuals(clamped);
-
-    const targetPlace = places[Math.round(clamped)];
-    if (targetPlace && mapRef.current) {
-      mapRef.current.easeTo({
-        center: [targetPlace.longitude, targetPlace.latitude],
-        duration: 800,
-      });
-    }
+    updateMapVisuals(clamped, { updateActive: true, forceCompleted: true });
   };
 
   const handleSpeedChange = (newSpeed: number) => {

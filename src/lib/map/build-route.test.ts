@@ -333,4 +333,197 @@ describe("build-route utilities", () => {
       expect(maxLat).toBeGreaterThan(20);
     });
   });
+
+  describe("Phase 2 & 10 Manual Visual Proof: Two-Stop Tokyo -> Paris seeking", () => {
+    const tokyoParis: TravelPlace[] = [
+      { id: "p1", name: "Tokyo", latitude: 35.6762, longitude: 139.6503, originalIndex: 0, journeyIndex: 0 },
+      { id: "p2", name: "Paris", latitude: 48.8566, longitude: 2.3522, originalIndex: 1, journeyIndex: 1 },
+    ];
+
+    it("should accurately move traveler and grow active route across seek fractions [0, 0.25, 0.5, 0.75, 1.0]", () => {
+      const prepared = prepareSegments(tokyoParis);
+      expect(prepared).toHaveLength(1);
+      expect(prepared[0].samples.length).toBe(129); // 128 intervals + 1 point
+
+      // seekTo(0)
+      const state0 = getTravelerState(tokyoParis, 0, prepared);
+      expect(state0?.position[0]).toBeCloseTo(139.6503, 2);
+      expect(state0?.position[1]).toBeCloseTo(35.6762, 2);
+      expect(state0?.isAtStop).toBe(true);
+      const route0 = buildOptimizedProgressRoute(prepared, 0);
+      expect(route0.activeGeoJson.features).toHaveLength(0);
+      expect(route0.completedGeoJson.features).toHaveLength(0);
+
+      // seekTo(0.25)
+      const state025 = getTravelerState(tokyoParis, 0.25, prepared);
+      expect(state025?.isTransit).toBe(true);
+      const route025 = buildOptimizedProgressRoute(prepared, 0.25);
+      expect(route025.activeGeoJson.features).toHaveLength(1);
+      const coords025 = (route025.activeGeoJson.features[0].geometry as { coordinates: number[][] }).coordinates;
+      expect(coords025.length).toBeGreaterThan(20);
+
+      // seekTo(0.5) - roughly halfway
+      const state05 = getTravelerState(tokyoParis, 0.5, prepared);
+      expect(state05?.isTransit).toBe(true);
+      const route05 = buildOptimizedProgressRoute(prepared, 0.5);
+      expect(route05.activeGeoJson.features).toHaveLength(1);
+      const coords05 = (route05.activeGeoJson.features[0].geometry as { coordinates: number[][] }).coordinates;
+      expect(coords05.length).toBeGreaterThan(coords025.length);
+
+      // seekTo(0.75)
+      const state075 = getTravelerState(tokyoParis, 0.75, prepared);
+      expect(state075?.isTransit).toBe(true);
+      const route075 = buildOptimizedProgressRoute(prepared, 0.75);
+      expect(route075.activeGeoJson.features).toHaveLength(1);
+      const coords075 = (route075.activeGeoJson.features[0].geometry as { coordinates: number[][] }).coordinates;
+      expect(coords075.length).toBeGreaterThan(coords05.length);
+
+      // seekTo(1.0) - arrived at Paris
+      const state1 = getTravelerState(tokyoParis, 1.0, prepared);
+      expect(state1?.position[0]).toBeCloseTo(2.3522, 2);
+      expect(state1?.position[1]).toBeCloseTo(48.8566, 2);
+      expect(state1?.isAtStop).toBe(true);
+      expect(state1?.arrivedStopIndex).toBe(1);
+      const route1 = buildOptimizedProgressRoute(prepared, 1.0);
+      expect(route1.completedGeoJson.features).toHaveLength(1);
+      expect(route1.activeGeoJson.features).toHaveLength(0);
+    });
+  });
+
+  describe("Phase 11 Multi-Stop Route: Tokyo -> Paris -> New York -> Sydney", () => {
+    const multiPlaces: TravelPlace[] = [
+      { id: "1", name: "Tokyo", latitude: 35.6762, longitude: 139.6503, originalIndex: 0, journeyIndex: 0 },
+      { id: "2", name: "Paris", latitude: 48.8566, longitude: 2.3522, originalIndex: 1, journeyIndex: 1 },
+      { id: "3", name: "New York", latitude: 40.7128, longitude: -74.006, originalIndex: 2, journeyIndex: 2 },
+      { id: "4", name: "Sydney", latitude: -33.8688, longitude: 151.2093, originalIndex: 3, journeyIndex: 3 },
+    ];
+
+    it("should correctly handle progress across all 3 segments", () => {
+      const prepared = prepareSegments(multiPlaces);
+      expect(prepared).toHaveLength(3);
+
+      // At stop 0
+      const s0 = getTravelerState(multiPlaces, 0, prepared);
+      expect(s0?.departedStopIndex).toBe(0);
+      expect(s0?.destinationStopIndex).toBe(1);
+      expect(s0?.isAtStop).toBe(true);
+
+      // En route to Paris
+      const s05 = getTravelerState(multiPlaces, 0.5, prepared);
+      expect(s05?.isTransit).toBe(true);
+      expect(s05?.destinationStopIndex).toBe(1);
+
+      // En route to NY
+      const s15 = getTravelerState(multiPlaces, 1.5, prepared);
+      expect(s15?.isTransit).toBe(true);
+      expect(s15?.departedStopIndex).toBe(1);
+      expect(s15?.destinationStopIndex).toBe(2);
+      const r15 = buildOptimizedProgressRoute(prepared, 1.5);
+      expect(r15.completedGeoJson.features).toHaveLength(1);
+      expect(r15.activeGeoJson.features).toHaveLength(1);
+
+      // En route to Sydney
+      const s25 = getTravelerState(multiPlaces, 2.5, prepared);
+      expect(s25?.isTransit).toBe(true);
+      expect(s25?.departedStopIndex).toBe(2);
+      expect(s25?.destinationStopIndex).toBe(3);
+      const r25 = buildOptimizedProgressRoute(prepared, 2.5);
+      expect(r25.completedGeoJson.features).toHaveLength(2);
+      expect(r25.activeGeoJson.features).toHaveLength(1);
+
+      // Arrived at Sydney (progress 3.0)
+      const s3 = getTravelerState(multiPlaces, 3.0, prepared);
+      expect(s3?.isAtStop).toBe(true);
+      expect(s3?.arrivedStopIndex).toBe(3);
+      const r3 = buildOptimizedProgressRoute(prepared, 3.0);
+      expect(r3.completedGeoJson.features).toHaveLength(3);
+      expect(r3.activeGeoJson.features).toHaveLength(0);
+    });
+  });
+
+  describe("Trace progression and exact coordinate alignment", () => {
+    const places: TravelPlace[] = [
+      { id: "a", name: "A - London", latitude: 51.5074, longitude: -0.1278, originalIndex: 0, journeyIndex: 0 },
+      { id: "b", name: "B - Rome", latitude: 41.9028, longitude: 12.4964, originalIndex: 1, journeyIndex: 1 },
+      { id: "c", name: "C - Cairo", latitude: 30.0444, longitude: 31.2357, originalIndex: 2, journeyIndex: 2 },
+    ];
+
+    it("should guarantee traveler position matches the exact tip of the active route at every step", () => {
+      const prepared = prepareSegments(places);
+      const testFractions = [0.05, 0.12, 0.333, 0.5, 0.77, 0.95, 1.05, 1.45, 1.88];
+
+      for (const prog of testFractions) {
+        const state = getTravelerState(places, prog, prepared);
+        const route = buildOptimizedProgressRoute(prepared, prog);
+
+        expect(state).not.toBeNull();
+        expect(route.activeGeoJson.features).toHaveLength(1);
+
+        const activeFeature = route.activeGeoJson.features[0];
+        const coords = (activeFeature.geometry as { coordinates: number[][] }).coordinates;
+        const lastCoord = coords[coords.length - 1];
+
+        // The traveler position must match the last coordinate of the active route
+        expect(state!.position[0]).toBeCloseTo(lastCoord[0], 6);
+        expect(state!.position[1]).toBeCloseTo(lastCoord[1], 6);
+      }
+    });
+
+    it("should follow the complete progression lifecycle: Future -> Active Growing -> Completed Green", () => {
+      const prepared = prepareSegments(places);
+      const fullRoute = buildFullRouteFeatureCollection(places);
+
+      // Future route has all segments
+      expect(fullRoute.features).toHaveLength(2);
+
+      // 1. Before playback (prog = 0)
+      const prog0State = getTravelerState(places, 0, prepared);
+      const prog0Route = buildOptimizedProgressRoute(prepared, 0);
+      expect(prog0State?.position[0]).toBeCloseTo(places[0].longitude, 4);
+      expect(prog0State?.position[1]).toBeCloseTo(places[0].latitude, 4);
+      expect(prog0Route.completedGeoJson.features).toHaveLength(0);
+      expect(prog0Route.activeGeoJson.features).toHaveLength(0);
+
+      // 2. During A -> B (prog = 0.4)
+      const prog04State = getTravelerState(places, 0.4, prepared);
+      const prog04Route = buildOptimizedProgressRoute(prepared, 0.4);
+      expect(prog04State?.isTransit).toBe(true);
+      expect(prog04State?.departedStopIndex).toBe(0);
+      expect(prog04State?.destinationStopIndex).toBe(1);
+      expect(prog04Route.completedGeoJson.features).toHaveLength(0);
+      expect(prog04Route.activeGeoJson.features).toHaveLength(1);
+
+      // 3. Arriving at B (prog = 1.0)
+      const prog1State = getTravelerState(places, 1.0, prepared);
+      const prog1Route = buildOptimizedProgressRoute(prepared, 1.0);
+      expect(prog1State?.isAtStop).toBe(true);
+      expect(prog1State?.arrivedStopIndex).toBe(1);
+      expect(prog1State?.position[0]).toBeCloseTo(places[1].longitude, 4);
+      expect(prog1State?.position[1]).toBeCloseTo(places[1].latitude, 4);
+      // Finished segment A -> B is now completed
+      expect(prog1Route.completedGeoJson.features).toHaveLength(1);
+      expect(prog1Route.completedGeoJson.features[0].properties?.segmentIndex).toBe(0);
+      expect(prog1Route.activeGeoJson.features).toHaveLength(0);
+
+      // 4. During B -> C (prog = 1.6)
+      const prog16State = getTravelerState(places, 1.6, prepared);
+      const prog16Route = buildOptimizedProgressRoute(prepared, 1.6);
+      expect(prog16State?.isTransit).toBe(true);
+      expect(prog16State?.departedStopIndex).toBe(1);
+      expect(prog16State?.destinationStopIndex).toBe(2);
+      expect(prog16Route.completedGeoJson.features).toHaveLength(1);
+      expect(prog16Route.activeGeoJson.features).toHaveLength(1);
+      expect(prog16Route.activeGeoJson.features[0].properties?.segmentIndex).toBe(1);
+
+      // 5. Arrived at C (prog = 2.0)
+      const prog2State = getTravelerState(places, 2.0, prepared);
+      const prog2Route = buildOptimizedProgressRoute(prepared, 2.0);
+      expect(prog2State?.isAtStop).toBe(true);
+      expect(prog2State?.arrivedStopIndex).toBe(2);
+      expect(prog2State?.position[0]).toBeCloseTo(places[2].longitude, 4);
+      expect(prog2State?.position[1]).toBeCloseTo(places[2].latitude, 4);
+      expect(prog2Route.completedGeoJson.features).toHaveLength(2);
+      expect(prog2Route.activeGeoJson.features).toHaveLength(0);
+    });
+  });
 });

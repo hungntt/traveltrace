@@ -141,7 +141,7 @@ export function prepareSegments(places: TravelPlace[]): PreparedSegment[] {
   if (places.length < 2) return [];
 
   const segments: PreparedSegment[] = [];
-  const SAMPLES_PER_SEGMENT = 64;
+  const SAMPLES_PER_SEGMENT = 128;
 
   for (let i = 0; i < places.length - 1; i++) {
     const p1: [number, number] = [places[i].longitude, places[i].latitude];
@@ -292,6 +292,7 @@ export function buildProgressRouteGeoJSON(
 
 /**
  * Optimized runtime progress route generator that reuses precomputed segments.
+ * Performs zero Turf calculations for maximum frame rates.
  */
 export function buildOptimizedProgressRoute(
   preparedSegments: PreparedSegment[],
@@ -335,15 +336,38 @@ export function buildOptimizedProgressRoute(
   }
 
   const activeFeatures: Feature<LineString | MultiLineString>[] = [];
-  if (segmentFraction > 0.001) {
+  if (segmentFraction > 0.0001) {
     const curSeg = preparedSegments[currentSegmentIndex];
-    const currentPoint = intermediatePoint(curSeg.p1, curSeg.p2, segmentFraction);
-    const activeSegment = buildGreatCircleSegment(
-      curSeg.p1,
-      currentPoint,
-      currentSegmentIndex
-    );
-    activeFeatures.push(activeSegment);
+    const samples = curSeg.unwrappedSamples?.length ? curSeg.unwrappedSamples : curSeg.samples;
+    const scaled = segmentFraction * (samples.length - 1);
+    const sampleIdx = Math.min(Math.floor(scaled), samples.length - 2);
+    const subFraction = scaled - sampleIdx;
+
+    const pA = samples[sampleIdx];
+    const pB = samples[sampleIdx + 1];
+
+    const currentPt: [number, number] = [
+      pA[0] + subFraction * (pB[0] - pA[0]),
+      pA[1] + subFraction * (pB[1] - pA[1]),
+    ];
+
+    const activeCoords: [number, number][] = [
+      ...samples.slice(0, sampleIdx + 1),
+      currentPt,
+    ];
+
+    if (activeCoords.length >= 2) {
+      activeFeatures.push({
+        type: "Feature",
+        properties: {
+          segmentIndex: currentSegmentIndex,
+        },
+        geometry: {
+          type: "LineString",
+          coordinates: activeCoords,
+        },
+      });
+    }
   }
 
   return {
@@ -360,6 +384,7 @@ export function buildOptimizedProgressRoute(
 
 /**
  * Calculates current traveler position, bearing, and stop status given progress (0 to N-1).
+ * Uses precomputed segment samples when available to avoid runtime trigonometric overhead.
  */
 export function getTravelerState(
   places: TravelPlace[],
@@ -423,33 +448,49 @@ export function getTravelerState(
   const currentSegmentIndex = Math.min(Math.floor(clampedProgress), places.length - 2);
   const segmentFraction = clampedProgress - currentSegmentIndex;
 
-  const p1 =
-    preparedSegments && preparedSegments[currentSegmentIndex]
-      ? preparedSegments[currentSegmentIndex].p1
-      : ([places[currentSegmentIndex].longitude, places[currentSegmentIndex].latitude] as [
-          number,
-          number
-        ]);
-  const p2 =
-    preparedSegments && preparedSegments[currentSegmentIndex]
-      ? preparedSegments[currentSegmentIndex].p2
-      : ([places[currentSegmentIndex + 1].longitude, places[currentSegmentIndex + 1].latitude] as [
-          number,
-          number
-        ]);
+  let position: [number, number];
+  let bearing: number;
 
-  const rawPosition = intermediatePoint(p1, p2, segmentFraction);
+  const seg = preparedSegments && preparedSegments[currentSegmentIndex];
+  if (seg && (seg.unwrappedSamples?.length ?? seg.samples?.length) >= 2) {
+    const samples = seg.unwrappedSamples?.length ? seg.unwrappedSamples : seg.samples;
+    const scaled = segmentFraction * (samples.length - 1);
+    const sampleIdx = Math.min(Math.floor(scaled), samples.length - 2);
+    const subFraction = scaled - sampleIdx;
+    const pA = samples[sampleIdx];
+    const pB = samples[sampleIdx + 1];
 
-  // For continuous motion across date line, unwrap relative to start of segment
-  const position: [number, number] = [
-    unwrapLongitude(rawPosition[0], p1[0]),
-    rawPosition[1],
-  ];
+    position = [
+      pA[0] + subFraction * (pB[0] - pA[0]),
+      pA[1] + subFraction * (pB[1] - pA[1]),
+    ];
 
-  // Look ahead slightly along geodesic arc for bearing
-  const lookAheadFraction = Math.min(1, segmentFraction + 0.04);
-  const lookAheadPoint = intermediatePoint(p1, p2, lookAheadFraction);
-  const bearing = calculateBearing(rawPosition, lookAheadPoint);
+    const lookAheadIdx =
+      subFraction > 0.8 && sampleIdx + 2 < samples.length
+        ? sampleIdx + 2
+        : sampleIdx + 1;
+    bearing = calculateBearing(position, samples[lookAheadIdx]);
+    if (bearing === 0 && (pA[0] !== pB[0] || pA[1] !== pB[1])) {
+      bearing = calculateBearing(pA, pB);
+    }
+  } else {
+    const p1: [number, number] = [
+      places[currentSegmentIndex].longitude,
+      places[currentSegmentIndex].latitude,
+    ];
+    const p2: [number, number] = [
+      places[currentSegmentIndex + 1].longitude,
+      places[currentSegmentIndex + 1].latitude,
+    ];
+    const rawPos = intermediatePoint(p1, p2, segmentFraction);
+    const lookAheadFraction = Math.min(1, segmentFraction + 0.04);
+    const lookAheadPoint = intermediatePoint(p1, p2, lookAheadFraction);
+    bearing = calculateBearing(rawPos, lookAheadPoint);
+    position = [
+      unwrapLongitude(rawPos[0], places[currentSegmentIndex].longitude),
+      rawPos[1],
+    ];
+  }
 
   const isAtStop = segmentFraction < 0.001;
   const isTransit = !isAtStop;

@@ -207,12 +207,51 @@ td em { color: #a0a7a2; font-style: normal; }
 .map-fallback-notice { position: absolute; top: 14px; left: 14px; max-width: calc(100% - 80px); display: flex; align-items: center; gap: 8px; padding: 7px 12px; border-radius: 8px; background: rgba(255, 253, 248, 0.92); border: 1px solid rgba(24, 48, 41, 0.16); box-shadow: 0 4px 12px rgba(24, 48, 41, 0.08); font-size: 11px; font-weight: 700; color: #436251; z-index: 10; backdrop-filter: blur(6px); }
 .map-fallback-notice .notice-icon { width: 15px; height: 15px; border-radius: 50%; background: var(--green); color: white; display: grid; place-items: center; font-size: 9px; font-weight: 800; flex-shrink: 0; }
 
-/* Markers */
-.journey-stop-marker { width: 26px; height: 26px; border-radius: 50%; background: #fffdf8; border: 2.5px solid var(--green); color: var(--ink); font-size: 11px; font-weight: 800; display: grid; place-items: center; box-shadow: 0 3px 8px rgba(0, 0, 0, 0.18); cursor: pointer; transition: transform 0.2s ease, background-color 0.2s ease, border-color 0.2s ease; user-select: none; }
-.journey-stop-marker:hover { transform: scale(1.18); z-index: 5; }
-.journey-stop-marker.completed { background: var(--green); color: white; border-color: var(--green-dark); }
-.journey-stop-marker.target-destination { border-color: var(--orange); border-width: 3px; transform: scale(1.15); box-shadow: 0 0 0 4px rgba(223, 116, 67, 0.22); }
-.journey-stop-marker.active { background: var(--orange); border-color: #b55428; color: white; transform: scale(1.22); box-shadow: 0 0 0 5px rgba(223, 116, 67, 0.28); z-index: 10; }
+/* Destination Dot Markers (No visible numbers) */
+.journey-stop-marker {
+  position: relative;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #fffdf8;
+  border: 2px solid var(--green-dark);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25), 0 0 0 1.5px rgba(255, 255, 255, 0.9);
+  cursor: pointer;
+  transition: transform 0.15s ease, background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+  user-select: none;
+}
+/* Generous touch and click target area */
+.journey-stop-marker::before {
+  content: "";
+  position: absolute;
+  inset: -9px;
+  border-radius: 50%;
+}
+.journey-stop-marker:hover {
+  transform: scale(1.4);
+  z-index: 15;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3), 0 0 0 2px white;
+}
+.journey-stop-marker.completed {
+  background: var(--green-dark);
+  border-color: var(--green);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2), 0 0 0 1.5px white;
+}
+.journey-stop-marker.target-destination {
+  background: #fffdf8;
+  border-color: var(--orange);
+  border-width: 2.5px;
+  transform: scale(1.3);
+  box-shadow: 0 0 0 3px rgba(223, 116, 67, 0.28), 0 1px 4px rgba(0, 0, 0, 0.2);
+  z-index: 10;
+}
+.journey-stop-marker.active {
+  background: var(--orange);
+  border-color: #b55428;
+  transform: scale(1.4);
+  box-shadow: 0 0 0 4px rgba(223, 116, 67, 0.35), 0 1px 4px rgba(0, 0, 0, 0.25);
+  z-index: 20;
+}
 
 .traveler-marker-pin { position: relative; width: 36px; height: 36px; display: grid; place-items: center; pointer-events: none; z-index: 50; }
 .traveler-avatar { width: 30px; height: 30px; border-radius: 50%; background: var(--orange); border: 2.5px solid white; display: grid; place-items: center; box-shadow: 0 4px 14px rgba(223, 116, 67, 0.55), 0 2px 6px rgba(0, 0, 0, 0.25); }
@@ -224,7 +263,6 @@ td em { color: #a0a7a2; font-style: normal; }
 .custom-map-popup .maplibregl-popup-content { padding: 11px 14px; border-radius: 10px; background: var(--paper); border: 1px solid var(--line); box-shadow: 0 10px 25px rgba(24, 48, 41, 0.15); }
 .custom-map-popup .maplibregl-popup-tip { border-top-color: var(--paper); }
 .map-popup-card { display: flex; flex-direction: column; gap: 3px; max-width: 220px; }
-.popup-stop-tag { font-size: 8px; font-weight: 800; color: var(--orange); letter-spacing: 0.08em; text-transform: uppercase; }
 .popup-title { font-size: 13px; font-weight: 700; color: var(--ink); }
 .popup-address { margin: 0; font-size: 10px; color: var(--muted); }
 .popup-date { font-size: 10px; color: var(--green); font-weight: 700; margin-top: 2px; }
