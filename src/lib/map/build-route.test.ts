@@ -9,9 +9,11 @@ import {
   calculateBearing,
   calculateTotalRouteDistance,
   formatDistance,
+  getFollowZoom,
   getJourneyBounds,
   getPreparedRouteBounds,
   getTravelerState,
+  getVisibleTrace,
   intermediatePoint,
   prepareSegments,
   unwrapLongitude,
@@ -43,6 +45,107 @@ const samplePlaces: TravelPlace[] = [
     journeyIndex: 2,
   },
 ];
+
+describe("getVisibleTrace — the single rendered trace", () => {
+  const prepared = prepareSegments(samplePlaces);
+
+  it("is empty before the traveler moves", () => {
+    expect(getVisibleTrace(prepared, 0)).toEqual([]);
+    expect(getVisibleTrace(prepared, -1)).toEqual([]);
+    expect(getVisibleTrace([], 1.5)).toEqual([]);
+  });
+
+  it("ends exactly on the traveler position at every progress value", () => {
+    for (const progress of [0.001, 0.25, 0.5, 0.999, 1, 1.4, 1.75, 2]) {
+      const trace = getVisibleTrace(prepared, progress);
+      const traveler = getTravelerState(samplePlaces, progress, prepared);
+
+      expect(traveler).not.toBeNull();
+      expect(trace.at(-1)).toEqual(traveler!.position);
+    }
+  });
+
+  it("never includes geometry ahead of the traveler", () => {
+    const midFirstSegment = getVisibleTrace(prepared, 0.5);
+    const firstSegmentSamples = prepared[0].unwrappedSamples;
+    const halfwaySampleCount = Math.floor(firstSegmentSamples.length / 2) + 2;
+
+    // Only the flown part of segment 0 — nothing from segment 1 at all.
+    expect(midFirstSegment.length).toBeLessThanOrEqual(halfwaySampleCount);
+    // Every coordinate but the interpolated tip is a real sample of segment 0.
+    expect(midFirstSegment.slice(0, -1)).toEqual(
+      firstSegmentSamples.slice(0, midFirstSegment.length - 1)
+    );
+    // The traveler is mid-flight to Paris, so Paris itself is not on the trace yet.
+    expect(midFirstSegment).not.toContainEqual(firstSegmentSamples.at(-1));
+  });
+
+  it("grows monotonically and keeps every earlier coordinate", () => {
+    const earlier = getVisibleTrace(prepared, 1.2);
+    const later = getVisibleTrace(prepared, 1.8);
+
+    expect(later.length).toBeGreaterThan(earlier.length);
+    // Everything but the interpolated tip of the earlier trace is a prefix of the later one.
+    expect(later.slice(0, earlier.length - 1)).toEqual(earlier.slice(0, -1));
+  });
+
+  it("is one continuous line with no duplicated coordinate at a segment joint", () => {
+    const complete = getVisibleTrace(prepared, prepared.length);
+
+    for (let i = 1; i < complete.length; i++) {
+      const isDuplicate =
+        complete[i][0] === complete[i - 1][0] && complete[i][1] === complete[i - 1][1];
+      expect(isDuplicate).toBe(false);
+    }
+
+    // Start and end of the whole journey are the first and last prepared samples.
+    expect(complete[0]).toEqual(prepared[0].unwrappedSamples[0]);
+    expect(complete.at(-1)).toEqual(prepared.at(-1)!.unwrappedSamples.at(-1));
+    // Both stop-to-stop segments are present, minus the one shared joint coordinate.
+    expect(complete.length).toBe(
+      prepared[0].unwrappedSamples.length + prepared[1].unwrappedSamples.length - 1
+    );
+  });
+
+  it("passes exactly through each intermediate stop once it has been reached", () => {
+    const afterParis = getVisibleTrace(prepared, 1);
+    expect(afterParis.at(-1)).toEqual(prepared[0].unwrappedSamples.at(-1));
+    expect(afterParis.length).toBe(prepared[0].unwrappedSamples.length);
+  });
+
+  it("stays in one continuous world copy across the antimeridian", () => {
+    const pacific: TravelPlace[] = [
+      { id: "a", name: "Tokyo", latitude: 35.68, longitude: 139.65, originalIndex: 0, journeyIndex: 0 },
+      { id: "b", name: "Honolulu", latitude: 21.31, longitude: -157.86, originalIndex: 1, journeyIndex: 1 },
+    ];
+    const pacificPrepared = prepareSegments(pacific);
+    const trace = getVisibleTrace(pacificPrepared, 1);
+
+    // No ±360 jump between neighbours — the line must not wrap the long way round.
+    for (let i = 1; i < trace.length; i++) {
+      expect(Math.abs(trace[i][0] - trace[i - 1][0])).toBeLessThan(180);
+    }
+  });
+});
+
+describe("getFollowZoom", () => {
+  it("returns a usable default when there is nothing to follow", () => {
+    expect(getFollowZoom([])).toBe(10);
+  });
+
+  it("picks one stable zoom per journey, closer for shorter hops", () => {
+    const intercontinental = getFollowZoom(prepareSegments(samplePlaces));
+    const cityHop = getFollowZoom(
+      prepareSegments([
+        { id: "a", name: "Shibuya", latitude: 35.658, longitude: 139.701, originalIndex: 0, journeyIndex: 0 },
+        { id: "b", name: "Shinjuku", latitude: 35.69, longitude: 139.7, originalIndex: 1, journeyIndex: 1 },
+      ])
+    );
+
+    expect(cityHop).toBeGreaterThan(intercontinental);
+    expect(intercontinental).toBeGreaterThan(0);
+  });
+});
 
 describe("build-route utilities", () => {
   describe("unwrapLongitude", () => {

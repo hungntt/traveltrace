@@ -14,13 +14,14 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import { JOURNEY_SESSION_KEY } from "@/lib/journey-storage";
 import { getOrderedPlaces } from "@/lib/map/order";
 import {
-  buildPreparedFullRouteFeatureCollection,
-  buildOptimizedProgressRoute,
   calculateTotalRouteDistance,
   formatDistance,
+  getFollowZoom,
   getPreparedRouteBounds,
   getTravelerState,
+  getVisibleTrace,
   prepareSegments,
+  unwrapLongitude,
   type PreparedSegment,
 } from "@/lib/map/build-route";
 import {
@@ -162,20 +163,18 @@ function tryCaptureCanvasStream(map: MapLibreMap): MediaStream | null {
 }
 
 const EXPORT_ONLY_LAYER_IDS = [
-  "full-route-halo",
-  "full-route-line",
-  "completed-route-line",
-  "active-segment-line",
+  "journey-trace-halo",
+  "journey-trace-line",
   "destination-dots",
   "traveler-halo",
   "traveler-dot",
 ];
 
-// All the journey GL layers are hidden during normal interactive use — a canvas2D overlay
-// (drawTraceOverlay) and DOM markers render the trace/dots/traveler reliably instead, since
-// WebGL line/circle layers can silently fail to paint in constrained/software-rendered
-// environments. These GL layers exist solely so canvas.captureStream() has something to
-// record; flip them on only while a video export is recording.
+// During normal use the trace is a 2D canvas overlay and the stops/traveler are DOM markers,
+// because WebGL line/circle layers can silently fail to paint in constrained or
+// software-rendered environments. Neither overlay nor DOM elements are picked up by
+// canvas.captureStream(), so these GL layers mirror them onto the WebGL canvas; flip them
+// on only while a video export is recording.
 function setExportLayersVisible(map: MapLibreMap, visible: boolean): void {
   const visibility = visible ? "visible" : "none";
   for (const layerId of EXPORT_ONLY_LAYER_IDS) {
@@ -184,6 +183,16 @@ function setExportLayersVisible(map: MapLibreMap, visible: boolean): void {
     }
   }
 }
+
+// Camera modes: "follow" glides with the traveler, "fixed" leaves the map wherever it is.
+export type CameraMode = "follow" | "fixed";
+
+// Exponential damping time constant for Follow Camera, in milliseconds. Higher = lazier
+// camera. Applied frame-rate independently so playback speed does not change the feel.
+const FOLLOW_DAMPING_TAU_MS = 320;
+// How far ahead of the traveler (in progress units) the camera aims, so the traveler sits
+// slightly behind centre and the upcoming destination comes into view first.
+const FOLLOW_LOOK_AHEAD_PROGRESS = 0.08;
 
 function waitForStyleLoad(map: MapLibreMap): Promise<void> {
   return new Promise((resolve) => {
@@ -213,6 +222,9 @@ export function JourneyMap() {
   const [progress, setProgress] = useState(0);
   const [speed, setSpeed] = useState(1); // 0.5 | 1 | 2
 
+  // Camera state — "follow" tracks the traveler, "fixed" leaves the map where it is
+  const [cameraMode, setCameraMode] = useState<CameraMode>("follow");
+
   // Fullscreen state
   const [isFullscreen, setIsFullscreen] = useState(false);
 
@@ -226,14 +238,11 @@ export function JourneyMap() {
   const travelerMarkerRef = useRef<Marker | null>(null);
   const travelerPointerRef = useRef<HTMLElement | null>(null);
   const stopMarkersRef = useRef<{ marker: Marker; element: HTMLDivElement }[]>([]);
-  // Canvas2D trace overlay — draws the same preparedSegments geometry the GL layers use,
-  // but via 2D canvas drawing so it renders reliably regardless of WebGL pipeline issues.
+  // Canvas2D trace overlay — draws the exact coordinates getVisibleTrace() returns, but via
+  // 2D canvas so the trail renders reliably regardless of WebGL line-layer support. The
+  // geometry ref lets camera-driven redraws reuse the latest trace without recomputing it.
   const traceOverlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const traceGeometryRef = useRef<{
-    full: [number, number][][];
-    completed: [number, number][][];
-    active: [number, number][][];
-  }>({ full: [], completed: [], active: [] });
+  const visibleTraceRef = useRef<[number, number][]>([]);
   // Animation and lifecycle tracking refs
   const animationFrameRef = useRef<number | null>(null);
   const lastTimestampRef = useRef<number | null>(null);
@@ -241,14 +250,19 @@ export function JourneyMap() {
   const isPlayingRef = useRef(false);
   const speedRef = useRef(1);
   const pauseRemainingMsRef = useRef(0);
-  const lastCompletedSegmentRef = useRef<number>(-1);
   const lastStopSignatureRef = useRef<string | null>(null);
-  const lastActiveUpdateTimestampRef = useRef<number>(0);
   const lastUiSyncRef = useRef<number>(0);
   const lastDiagnosticLogRef = useRef<number>(0);
   const routeReadyLogKeyRef = useRef<string | null>(null);
   const initTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isFallbackRef = useRef(false);
+
+  // Camera refs. cameraRef holds the damped follow camera in the same unwrapped longitude
+  // space as the prepared segments, so it never jumps a world copy at the antimeridian.
+  // Once seeded it is authoritative and is never read back from the map.
+  const cameraModeRef = useRef<CameraMode>("follow");
+  const cameraRef = useRef<{ center: [number, number]; zoom: number } | null>(null);
+  const followZoomTargetRef = useRef<number | null>(null);
 
   // Video export refs
   const isExportingRef = useRef(false);
@@ -261,6 +275,7 @@ export function JourneyMap() {
   progressRef.current = progress;
   isPlayingRef.current = isPlaying;
   speedRef.current = speed;
+  cameraModeRef.current = cameraMode;
 
   // Load session storage
   useEffect(() => {
@@ -305,10 +320,9 @@ export function JourneyMap() {
       : preparedSegments[idx - 1]?.unwrappedSamples.at(-1) ?? [place.longitude, place.latitude];
   };
 
-  // Redraws the trace overlay canvas by projecting preparedSegments coordinates through the
-  // map's current camera (map.project). This is what users actually see for the route —
-  // reliable regardless of WebGL layer rendering — while the mirrored GL line layers stay
-  // hidden except during video export.
+  // Repaints the visible journey trace by projecting the trace coordinates through the
+  // map's current camera. Called every animation frame and on every camera move, so the
+  // trail stays pinned to the geography through pan, zoom, resize, and fullscreen.
   const drawTraceOverlay = () => {
     const map = mapRef.current;
     const canvas = traceOverlayCanvasRef.current;
@@ -328,44 +342,34 @@ export function JourneyMap() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
 
-    const strokeLines = (
-      lines: [number, number][][],
-      color: string,
-      lineWidth: number,
-      opacity: number
-    ) => {
-      if (lines.length === 0) return;
-      ctx.strokeStyle = color;
-      ctx.lineWidth = lineWidth;
-      ctx.globalAlpha = opacity;
-      ctx.lineCap = "round";
-      ctx.lineJoin = "round";
-      for (const line of lines) {
-        if (line.length < 2) continue;
-        ctx.beginPath();
-        line.forEach((coord, i) => {
-          const p = map.project(coord);
-          if (i === 0) ctx.moveTo(p.x, p.y);
-          else ctx.lineTo(p.x, p.y);
-        });
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 1;
-    };
+    const trace = visibleTraceRef.current;
+    if (trace.length < 2) return;
 
-    const { full, completed, active } = traceGeometryRef.current;
-    strokeLines(full, "#fffdf8", 7, 0.7); // halo, under everything
-    strokeLines(full, "#537864", 3.75, 0.75); // full/future trace
-    strokeLines(completed, "#1f6249", 4, 1); // completed trace
-    strokeLines(active, "#df7443", 5, 1); // active trace
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    ctx.beginPath();
+    trace.forEach((coord, i) => {
+      const point = map.project(coord);
+      if (i === 0) ctx.moveTo(point.x, point.y);
+      else ctx.lineTo(point.x, point.y);
+    });
+
+    // Halo first, then the trace itself — one path, stroked twice.
+    ctx.strokeStyle = "#fffdf8";
+    ctx.lineWidth = 7;
+    ctx.globalAlpha = 0.7;
+    ctx.stroke();
+
+    ctx.strokeStyle = "#1f6249"; // TravelTrace dark green
+    ctx.lineWidth = 4;
+    ctx.globalAlpha = 1;
+    ctx.stroke();
   };
 
-  // Update route layers, traveler point, and destination dot states.
-  // Returns true if visual objects exist and were successfully updated.
-  const updateMapVisuals = (
-    currentProg: number,
-    options?: { updateActive?: boolean; forceCompleted?: boolean }
-  ): boolean => {
+  // Update the journey trace, traveler point, and destination dot states from one
+  // progress value. Returns true if visual objects exist and were successfully updated.
+  const updateMapVisuals = (currentProg: number): boolean => {
     const map = mapRef.current;
     if (!map || places.length === 0) return false;
 
@@ -395,45 +399,28 @@ export function JourneyMap() {
       });
     }
 
-    // 3. Verify GeoJSON route sources exist
-    const completedSource = map.getSource("completed-route") as GeoJSONSource | undefined;
-    const activeSource = map.getSource("active-segment") as GeoJSONSource | undefined;
+    // 3. Update the one cumulative journey trace — the trail left behind the traveler.
+    // getVisibleTrace() derives it from the same progress value and the same sampled
+    // geometry as the traveler above, so the last coordinate of the line is exactly the
+    // traveler's position, and nothing ahead of the traveler is ever drawn. The overlay
+    // is what users see; the GL source mirrors it for video export.
+    const traceSource = map.getSource("journey-trace") as GeoJSONSource | undefined;
+    if (!traceSource) return false;
 
-    if (!completedSource || !activeSource) {
-      return false;
-    }
-
-    // 4. Update route layers using precomputed segment geometry
-    const { completedGeoJson, activeGeoJson } = buildOptimizedProgressRoute(
-      preparedSegments,
-      currentProg
+    const visibleCoordinates = getVisibleTrace(preparedSegments, currentProg);
+    visibleTraceRef.current = visibleCoordinates;
+    traceSource.setData(
+      visibleCoordinates.length >= 2
+        ? {
+            type: "Feature",
+            properties: {},
+            geometry: { type: "LineString", coordinates: visibleCoordinates },
+          }
+        : { type: "FeatureCollection", features: [] }
     );
-
-    const completedUntil = Math.floor(currentProg);
-    const needCompletedUpdate =
-      options?.forceCompleted ||
-      completedUntil !== lastCompletedSegmentRef.current ||
-      currentProg >= places.length - 1 ||
-      currentProg === 0;
-
-    if (needCompletedUpdate) {
-      completedSource.setData(completedGeoJson);
-      lastCompletedSegmentRef.current = completedUntil;
-      traceGeometryRef.current.completed = completedGeoJson.features.map(
-        (f) => f.geometry.coordinates as [number, number][]
-      );
-    }
-
-    if (options?.updateActive !== false) {
-      activeSource.setData(activeGeoJson);
-      traceGeometryRef.current.active = activeGeoJson.features.map(
-        (f) => f.geometry.coordinates as [number, number][]
-      );
-    }
-
     drawTraceOverlay();
 
-    // 5. Update destination dot states (only rebuild when the state actually changes)
+    // 4. Update destination dot states (only rebuild when the state actually changes)
     const isTransit = state.isTransit;
     const departedIdx = state.departedStopIndex;
     const destIdx = state.destinationStopIndex;
@@ -479,6 +466,63 @@ export function JourneyMap() {
     return true;
   };
 
+  // Where Follow Camera wants to be for a given progress: slightly ahead of the traveler
+  // along the route, so the next destination enters the frame before the traveler does.
+  const getFollowTarget = (currentProg: number): [number, number] | null => {
+    const maxProg = Math.max(0, places.length - 1);
+    const lookAheadProg = Math.min(maxProg, currentProg + FOLLOW_LOOK_AHEAD_PROGRESS);
+    const aheadState = getTravelerState(places, lookAheadProg, preparedSegments);
+    return aheadState?.position ?? null;
+  };
+
+  // Seeds the damped camera from wherever the map currently is, so engaging follow mode
+  // glides in from the present view instead of cutting to the traveler. The seeded
+  // longitude is unwrapped into the route's world copy so damping never crosses ±180.
+  const engageFollowCamera = () => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const center = map.getCenter();
+    const reference = getFollowTarget(progressRef.current);
+    cameraRef.current = {
+      center: [
+        reference ? unwrapLongitude(center.lng, reference[0]) : center.lng,
+        center.lat,
+      ],
+      zoom: map.getZoom(),
+    };
+    // One zoom target for the whole journey — never re-derived per segment. Zooming in to
+    // a distant world view is useful; pulling a user who zoomed further in back out is not.
+    followZoomTargetRef.current = Math.max(map.getZoom(), getFollowZoom(preparedSegments));
+  };
+
+  // Advances the damped follow camera by one frame and writes it to the map. Called only
+  // from the single animation loop; jumpTo starts no animation of its own, so successive
+  // frames never fight each other the way overlapping easeTo calls would.
+  const stepFollowCamera = (currentProg: number, deltaMs: number) => {
+    const map = mapRef.current;
+    if (!map || cameraModeRef.current !== "follow") return;
+
+    const target = getFollowTarget(currentProg);
+    if (!target) return;
+
+    if (!cameraRef.current) engageFollowCamera();
+    const current = cameraRef.current;
+    if (!current) return;
+
+    // Frame-rate independent exponential damping: the same easing at 30fps and 144fps.
+    const smoothing = 1 - Math.exp(-Math.max(0, deltaMs) / FOLLOW_DAMPING_TAU_MS);
+    const targetZoom = followZoomTargetRef.current ?? current.zoom;
+
+    current.center = [
+      current.center[0] + (target[0] - current.center[0]) * smoothing,
+      current.center[1] + (target[1] - current.center[1]) * smoothing,
+    ];
+    current.zoom = current.zoom + (targetZoom - current.zoom) * smoothing;
+
+    map.jumpTo({ center: current.center, zoom: current.zoom });
+  };
+
   // Guarded helper to initialize TravelTrace GeoJSON sources and layers.
   // Returns true only when all sources, layers, and initial visuals are verified ready.
   const initializeJourneyLayers = (
@@ -488,25 +532,22 @@ export function JourneyMap() {
     if (!map || currentPlaces.length === 0) return false;
 
     try {
-      // 1. Add Future / Full Route Line Layer (static during playback)
-      const fullRouteGeoJson = buildPreparedFullRouteFeatureCollection(preparedSegments);
-      traceGeometryRef.current.full = fullRouteGeoJson.features.map(
-        (f) => f.geometry.coordinates as [number, number][]
-      );
-      if (!map.getSource("full-route")) {
-        map.addSource("full-route", {
+      // 1. Add the single journey trace source. It starts empty — nothing is drawn until
+      // the traveler actually moves — and is the only route geometry on the map. Its two
+      // line layers stay hidden during normal use (the canvas overlay draws the same
+      // coordinates); they are switched on only while recording a video export.
+      if (!map.getSource("journey-trace")) {
+        map.addSource("journey-trace", {
           type: "geojson",
-          data: fullRouteGeoJson,
+          data: { type: "FeatureCollection", features: [] },
         });
-      } else {
-        (map.getSource("full-route") as GeoJSONSource).setData(fullRouteGeoJson);
       }
 
-      if (!map.getLayer("full-route-halo")) {
+      if (!map.getLayer("journey-trace-halo")) {
         map.addLayer({
-          id: "full-route-halo",
+          id: "journey-trace-halo",
           type: "line",
-          source: "full-route",
+          source: "journey-trace",
           layout: {
             "line-cap": "round",
             "line-join": "round",
@@ -520,37 +561,11 @@ export function JourneyMap() {
         });
       }
 
-      if (!map.getLayer("full-route-line")) {
+      if (!map.getLayer("journey-trace-line")) {
         map.addLayer({
-          id: "full-route-line",
+          id: "journey-trace-line",
           type: "line",
-          source: "full-route",
-          layout: {
-            "line-cap": "round",
-            "line-join": "round",
-            visibility: "none",
-          },
-          paint: {
-            "line-color": "#537864",
-            "line-width": 3.75,
-            "line-opacity": 0.75,
-          },
-        });
-      }
-
-      // 2. Add Completed Route Layer
-      if (!map.getSource("completed-route")) {
-        map.addSource("completed-route", {
-          type: "geojson",
-          data: { type: "FeatureCollection", features: [] },
-        });
-      }
-
-      if (!map.getLayer("completed-route-line")) {
-        map.addLayer({
-          id: "completed-route-line",
-          type: "line",
-          source: "completed-route",
+          source: "journey-trace",
           layout: {
             "line-cap": "round",
             "line-join": "round",
@@ -564,33 +579,7 @@ export function JourneyMap() {
         });
       }
 
-      // 3. Add Active Segment Layer
-      if (!map.getSource("active-segment")) {
-        map.addSource("active-segment", {
-          type: "geojson",
-          data: { type: "FeatureCollection", features: [] },
-        });
-      }
-
-      if (!map.getLayer("active-segment-line")) {
-        map.addLayer({
-          id: "active-segment-line",
-          type: "line",
-          source: "active-segment",
-          layout: {
-            "line-cap": "round",
-            "line-join": "round",
-            visibility: "none",
-          },
-          paint: {
-            "line-color": "#df7443", // TravelTrace orange
-            "line-width": 5,
-            "line-opacity": 1,
-          },
-        });
-      }
-
-      // 4. Add Destination Dot Layer. Hidden by default — the DOM stop markers below are
+      // 2. Add Destination Dot Layer. Hidden by default — the DOM stop markers below are
       // what users see; this layer is switched to visible only while recording a video
       // export, so canvas.captureStream() has something to record.
       if (!map.getSource("destination-points")) {
@@ -622,7 +611,7 @@ export function JourneyMap() {
         });
       }
 
-      // 5. Add Traveler Point Layer (circle glow + dot). Also hidden by default for the
+      // 3. Add Traveler Point Layer (circle glow + dot). Also hidden by default for the
       // same reason — the DOM traveler marker below is the reliable, visible one.
       if (!map.getSource("traveler-point")) {
         map.addSource("traveler-point", {
@@ -672,10 +661,8 @@ export function JourneyMap() {
 
       // Explicitly restore the journey stack above every basemap layer, in order.
       for (const layerId of [
-        "full-route-halo",
-        "full-route-line",
-        "completed-route-line",
-        "active-segment-line",
+        "journey-trace-halo",
+        "journey-trace-line",
         "destination-dots",
         "traveler-halo",
         "traveler-dot",
@@ -685,7 +672,7 @@ export function JourneyMap() {
         }
       }
 
-      // 6. Add Destination Dot DOM Markers with Safe Popups — the reliable, visible stops.
+      // 4. Add Destination Dot DOM Markers with Safe Popups — the reliable, visible stops.
       stopMarkersRef.current.forEach(({ marker }) => marker.remove());
       stopMarkersRef.current = currentPlaces.map((place, idx) => {
         const stopNum = idx + 1;
@@ -709,7 +696,7 @@ export function JourneyMap() {
         return { marker, element: el };
       });
 
-      // 7. Add Directional Traveler DOM Marker — the reliable, visible traveler.
+      // 5. Add Directional Traveler DOM Marker — the reliable, visible traveler.
       travelerMarkerRef.current?.remove();
       const { container: travelerEl, pointer: travelerPointer } = createTravelerElement();
       const initialPos: [number, number] = preparedSegments[0]?.unwrappedSamples[0] ?? [
@@ -742,20 +729,16 @@ export function JourneyMap() {
       travelerPointerRef.current = travelerPointer;
 
       // Verify every required source, layer, and marker.
-      const hasFullRoute = Boolean(map.getSource("full-route"));
-      const hasFullRouteLine = Boolean(map.getLayer("full-route-line"));
-      const hasCompletedRoute = Boolean(map.getSource("completed-route"));
-      const hasActiveSegment = Boolean(map.getSource("active-segment"));
+      const hasJourneyTrace = Boolean(map.getSource("journey-trace"));
+      const hasJourneyTraceLine = Boolean(map.getLayer("journey-trace-line"));
       const hasDestinationPoints = Boolean(map.getSource("destination-points"));
       const hasTraveler = Boolean(map.getSource("traveler-point"));
       const hasTravelerMarker = Boolean(travelerMarkerRef.current);
       const hasAllStopMarkers = stopMarkersRef.current.length === currentPlaces.length;
 
       if (
-        !hasFullRoute ||
-        !hasFullRouteLine ||
-        !hasCompletedRoute ||
-        !hasActiveSegment ||
+        !hasJourneyTrace ||
+        !hasJourneyTraceLine ||
         !hasDestinationPoints ||
         !hasTraveler ||
         !hasTravelerMarker ||
@@ -766,44 +749,39 @@ export function JourneyMap() {
       }
 
       lastStopSignatureRef.current = null;
-      const visualUpdated = updateMapVisuals(progressRef.current, {
-        updateActive: true,
-        forceCompleted: true,
-      });
+      const visualUpdated = updateMapVisuals(progressRef.current);
 
       if (process.env.NODE_ENV !== "production") {
         const expectedSegments = currentPlaces.length - 1;
-        const everyFeatureHasLine = fullRouteGeoJson.features.every(
-          (feature) => feature.geometry.coordinates.length >= 2
-        );
 
         console.assert(
           preparedSegments.length === expectedSegments,
           "[TravelTrace route] Prepared segment count does not match stop count."
         );
-        console.assert(hasFullRoute, "[TravelTrace route] full-route source is missing.");
-        console.assert(hasFullRouteLine, "[TravelTrace route] full-route-line layer is missing.");
         console.assert(
-          fullRouteGeoJson.features.length === expectedSegments,
-          "[TravelTrace route] Full-route feature count does not match stop count."
+          hasJourneyTrace,
+          "[TravelTrace route] journey-trace source is missing."
         );
         console.assert(
-          everyFeatureHasLine,
-          "[TravelTrace route] Every route feature must have at least two coordinates."
+          hasJourneyTraceLine,
+          "[TravelTrace route] journey-trace-line layer is missing."
+        );
+        console.assert(
+          getVisibleTrace(preparedSegments, 0).length === 0,
+          "[TravelTrace route] The trace must be empty at progress 0."
         );
 
         const routeLogKey = currentPlaces
           .map((place) => [place.id, place.longitude, place.latitude].join(":"))
           .join("|");
         if (routeReadyLogKeyRef.current !== routeLogKey) {
-          const firstFeature = fullRouteGeoJson.features[0];
-          const lastFeature = fullRouteGeoJson.features.at(-1);
+          const completeTrace = getVisibleTrace(preparedSegments, preparedSegments.length);
           routeReadyLogKeyRef.current = routeLogKey;
           console.info("[TravelTrace route ready]", {
             stops: currentPlaces.length,
             segments: preparedSegments.length,
-            firstCoordinate: firstFeature?.geometry.coordinates[0],
-            lastCoordinate: lastFeature?.geometry.coordinates.at(-1),
+            firstCoordinate: completeTrace[0],
+            lastCoordinate: completeTrace.at(-1),
             bounds: getPreparedRouteBounds(preparedSegments, currentPlaces),
           });
         }
@@ -825,8 +803,10 @@ export function JourneyMap() {
     setIsFallback(false);
     isFallbackRef.current = false;
     setMapErrorMessage(null);
-    lastCompletedSegmentRef.current = -1;
     lastStopSignatureRef.current = null;
+    visibleTraceRef.current = [];
+    cameraRef.current = null;
+    followZoomTargetRef.current = null;
 
     const bounds = getPreparedRouteBounds(preparedSegments, places);
 
@@ -860,10 +840,35 @@ export function JourneyMap() {
       "top-right"
     );
 
-    // Keep the canvas2D trace overlay in sync with the camera during pan/zoom/fitBounds,
+    // Keep the trace overlay aligned with the camera during pan/zoom/fitBounds/follow,
     // not just during playback animation frames.
     map.on("move", drawTraceOverlay);
     map.on("resize", drawTraceOverlay);
+
+    // Manual map interaction hands control back to the user: touching the map (or its
+    // zoom controls) while following switches to Fixed Map rather than fighting the drag.
+    // Real input events on the container never fire for our own programmatic camera
+    // moves, so no gesture bookkeeping is needed to tell the two apart.
+    const handleManualInteraction = (event: Event) => {
+      if (cameraModeRef.current !== "follow") return;
+      // Clicking a stop marker or its popup seeks the journey; it is not a camera gesture.
+      const target = event.target as HTMLElement | null;
+      if (target?.closest?.(".maplibregl-marker, .maplibregl-popup")) return;
+
+      // Switch the ref immediately so the very next animation frame stops steering, rather
+      // than waiting for the React re-render and fighting the gesture in between.
+      cameraModeRef.current = "fixed";
+      cameraRef.current = null;
+      followZoomTargetRef.current = null;
+      setCameraMode("fixed");
+    };
+    const interactionTarget = map.getContainer();
+    const MANUAL_INTERACTION_EVENTS = ["mousedown", "touchstart", "wheel"] as const;
+    for (const eventName of MANUAL_INTERACTION_EVENTS) {
+      interactionTarget.addEventListener(eventName, handleManualInteraction, {
+        passive: true,
+      });
+    }
 
     // Style load handler (fired for primary style and any fallback style)
     const handleStyleLoad = () => {
@@ -946,6 +951,9 @@ export function JourneyMap() {
         cancelAnimationFrame(animationFrameRef.current);
         animationFrameRef.current = null;
       }
+      for (const eventName of MANUAL_INTERACTION_EVENTS) {
+        interactionTarget.removeEventListener(eventName, handleManualInteraction);
+      }
       stopMarkersRef.current.forEach(({ marker }) => marker.remove());
       stopMarkersRef.current = [];
       travelerMarkerRef.current?.remove();
@@ -990,7 +998,6 @@ export function JourneyMap() {
     if (progressRef.current >= maxProg) {
       progressRef.current = 0;
       setProgress(0);
-      lastCompletedSegmentRef.current = -1;
     }
 
     // Fast, energetic flight duration: ~1.8s per segment at 1x speed
@@ -1006,9 +1013,11 @@ export function JourneyMap() {
       const deltaMs = Math.min(100, timestamp - lastTimestampRef.current);
       lastTimestampRef.current = timestamp;
 
-      // Handle pause at reached stops
+      // Handle pause at reached stops. The camera keeps damping so it settles onto the
+      // stop during the pause instead of freezing mid-glide.
       if (pauseRemainingMsRef.current > 0) {
         pauseRemainingMsRef.current -= deltaMs;
+        stepFollowCamera(progressRef.current, deltaMs);
         animationFrameRef.current = requestAnimationFrame(animate);
         return;
       }
@@ -1024,33 +1033,32 @@ export function JourneyMap() {
       if (nextStopFloor > prevStopFloor && nextStopFloor < places.length) {
         nextProgress = nextStopFloor;
         pauseRemainingMsRef.current = STOP_PAUSE_DURATION_MS / speedRef.current;
-        progressRef.current = nextProgress;
-        updateMapVisuals(nextProgress, { updateActive: true, forceCompleted: true });
-        setProgress(nextProgress); // Immediate sync at stop
-        animationFrameRef.current = requestAnimationFrame(animate);
-        return;
+      } else if (nextProgress >= maxProg) {
+        nextProgress = maxProg;
       }
 
+      progressRef.current = nextProgress;
+
+      // One progress value drives everything: traveler marker, journey trace, stop dots,
+      // and the camera. Nothing below keeps its own copy of the animation state.
+      updateMapVisuals(nextProgress);
+      stepFollowCamera(nextProgress, deltaMs);
+
       if (nextProgress >= maxProg) {
-        nextProgress = maxProg;
-        progressRef.current = nextProgress;
-        updateMapVisuals(nextProgress, { updateActive: true, forceCompleted: true });
+        // The final stop also trips the boundary branch above; clear its pause so it does
+        // not carry over and stall the first moments of the next play.
+        pauseRemainingMsRef.current = 0;
         setProgress(nextProgress); // Immediate sync on journey end
         setIsPlaying(false);
         isPlayingRef.current = false;
         return;
       }
 
-      progressRef.current = nextProgress;
-
-      // Update traveler point, active orange route, and stop dot states smoothly every frame
-      updateMapVisuals(nextProgress, {
-        updateActive: true,
-        forceCompleted: false,
-      });
-
-      // Throttle React progress updates to ~10 FPS (100ms)
-      if (timestamp - lastUiSyncRef.current >= 100) {
+      // Throttle React progress updates to ~10 FPS (100ms), but sync immediately on arrival
+      if (
+        pauseRemainingMsRef.current > 0 ||
+        timestamp - lastUiSyncRef.current >= 100
+      ) {
         setProgress(nextProgress);
         lastUiSyncRef.current = timestamp;
       }
@@ -1059,11 +1067,11 @@ export function JourneyMap() {
       if (process.env.NODE_ENV !== "production" && timestamp - lastDiagnosticLogRef.current >= 1000) {
         lastDiagnosticLogRef.current = timestamp;
         console.debug("[TravelTrace Animation Diagnostic]", {
-          progressRef: progressRef.current,
-          reactProgress: progressRef.current,
+          progress: progressRef.current,
+          cameraMode: cameraModeRef.current,
           animationReady,
-          activeSourceExists: Boolean(mapRef.current?.getSource("active-segment")),
-          completedSourceExists: Boolean(mapRef.current?.getSource("completed-route")),
+          traceSourceExists: Boolean(mapRef.current?.getSource("journey-trace")),
+          traceCoordinates: getVisibleTrace(preparedSegments, progressRef.current).length,
           mapLoaded: mapRef.current?.loaded(),
           styleLoaded: mapRef.current?.isStyleLoaded(),
         });
@@ -1117,13 +1125,17 @@ export function JourneyMap() {
     progressRef.current = 0;
     setProgress(0);
     pauseRemainingMsRef.current = 0;
-    lastCompletedSegmentRef.current = -1;
-    updateMapVisuals(0, { updateActive: true, forceCompleted: true });
+    updateMapVisuals(0);
   };
 
   const handleReplay = () => {
     resetProgressToStart();
-    fitWholeJourney();
+    // Follow mode cuts straight back to the start; fixed mode re-frames the whole journey.
+    if (cameraModeRef.current === "follow") {
+      jumpFollowCameraTo(0);
+    } else {
+      fitWholeJourney();
+    }
     if (places.length > 1 && animationReady) {
       setIsPlaying(true);
     }
@@ -1148,11 +1160,32 @@ export function JourneyMap() {
     progressRef.current = clamped;
     setProgress(clamped);
     pauseRemainingMsRef.current = 0;
-    updateMapVisuals(clamped, { updateActive: true, forceCompleted: true });
+    updateMapVisuals(clamped);
+    // Scrubbing and stop jumps are discrete, so the camera moves with a single jump rather
+    // than a damped glide; while playing the loop takes over again on the next frame.
+    if (!isPlayingRef.current) {
+      jumpFollowCameraTo(clamped);
+    }
   };
 
   const handleSpeedChange = (newSpeed: number) => {
     setSpeed(newSpeed);
+  };
+
+  // Discrete camera move for follow mode (seek, replay). No-op in fixed mode.
+  const jumpFollowCameraTo = (currentProg: number) => {
+    const map = mapRef.current;
+    if (!map || cameraModeRef.current !== "follow") return;
+
+    const target = getFollowTarget(currentProg);
+    if (!target) return;
+
+    const zoom =
+      followZoomTargetRef.current ??
+      Math.max(map.getZoom(), getFollowZoom(preparedSegments));
+    followZoomTargetRef.current = zoom;
+    cameraRef.current = { center: target, zoom };
+    map.jumpTo({ center: target, zoom });
   };
 
   const fitWholeJourney = () => {
@@ -1163,6 +1196,42 @@ export function JourneyMap() {
       maxZoom: 13,
       duration: 1000,
     });
+  };
+
+  // Follow Camera: glide with the traveler again. While playing, the animation loop
+  // re-seeds itself from the live view so the transition stays smooth; while paused a
+  // single easeTo brings the traveler into frame (no loop is running to conflict with it).
+  const handleFollowCamera = () => {
+    cameraModeRef.current = "follow";
+    setCameraMode("follow");
+
+    const map = mapRef.current;
+    if (!map) return;
+
+    // Leave the damped camera unseeded either way, so the next animation frame picks up
+    // from wherever the map actually is rather than snapping to a precomputed position.
+    cameraRef.current = null;
+    followZoomTargetRef.current = null;
+    if (isPlayingRef.current) return;
+
+    const target = getFollowTarget(progressRef.current);
+    if (!target) return;
+
+    map.easeTo({
+      center: target,
+      zoom: Math.max(map.getZoom(), getFollowZoom(preparedSegments)),
+      duration: 700,
+    });
+  };
+
+  // Fixed Map: frame the whole journey once, then leave the camera entirely alone.
+  // Playback and the growing trace continue; the user is free to pan and zoom.
+  const handleFixedCamera = () => {
+    cameraModeRef.current = "fixed";
+    setCameraMode("fixed");
+    cameraRef.current = null;
+    followZoomTargetRef.current = null;
+    fitWholeJourney();
   };
 
   const handleRetryMap = () => {
@@ -1356,7 +1425,8 @@ export function JourneyMap() {
               className="maplibre-canvas-container"
               aria-label="Interactive travel journey map"
             />
-            {/* Renders the route trace reliably via 2D canvas drawing (see drawTraceOverlay) */}
+            {/* The trail behind the traveler (see drawTraceOverlay) — drawn with 2D canvas
+                so it paints reliably above the basemap, below the markers. */}
             <canvas ref={traceOverlayCanvasRef} className="trace-overlay-canvas" aria-hidden="true" />
 
             {/* Non-blocking Fallback Notice */}
@@ -1422,6 +1492,7 @@ export function JourneyMap() {
                   destinationStopIndex={travelerState?.destinationStopIndex ?? 0}
                   arrivedStopIndex={travelerState?.arrivedStopIndex ?? 0}
                   animationReady={animationReady}
+                  cameraMode={cameraMode}
                   compact
                   isFullscreen
                   isExporting={isExporting}
@@ -1432,7 +1503,8 @@ export function JourneyMap() {
                   onNext={handleNext}
                   onSeek={seekTo}
                   onSpeedChange={handleSpeedChange}
-                  onFitJourney={fitWholeJourney}
+                  onFollowCamera={handleFollowCamera}
+                  onFixedCamera={handleFixedCamera}
                   onToggleFullscreen={handleToggleFullscreen}
                   onExportVideo={handleExportVideo}
                 />
@@ -1453,6 +1525,7 @@ export function JourneyMap() {
                 destinationStopIndex={travelerState?.destinationStopIndex ?? 0}
                 arrivedStopIndex={travelerState?.arrivedStopIndex ?? 0}
                 animationReady={animationReady}
+                cameraMode={cameraMode}
                 isExporting={isExporting}
                 onPlay={handlePlay}
                 onPause={handlePause}
@@ -1461,7 +1534,8 @@ export function JourneyMap() {
                 onNext={handleNext}
                 onSeek={seekTo}
                 onSpeedChange={handleSpeedChange}
-                onFitJourney={fitWholeJourney}
+                onFollowCamera={handleFollowCamera}
+                onFixedCamera={handleFixedCamera}
                 onToggleFullscreen={handleToggleFullscreen}
                 onExportVideo={handleExportVideo}
               />

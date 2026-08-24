@@ -193,11 +193,11 @@ td em { color: #a0a7a2; font-style: normal; }
 
 .map-viewport-card { position: relative; width: 100%; height: clamp(520px, 68vh, 760px); border-radius: 18px; border: 1px solid rgba(24, 48, 41, 0.14); overflow: hidden; box-shadow: 0 20px 55px rgba(35, 51, 41, 0.12); background: #e5ece6; }
 .maplibre-canvas-container { width: 100%; height: 100%; }
-/* Draws the route trace via 2D canvas (see drawTraceOverlay in JourneyMap.tsx) — renders
-   reliably regardless of WebGL layer support. Sits above the MapLibre canvas, below markers/UI.
-   MapLibre's own canvas/marker/popup elements use z-index:auto, so without an explicit
-   z-index here the trace canvas (a sibling of the map container, not a descendant) would
-   paint above everything rather than only above the basemap; bump markers/popups to match. */
+/* Draws the trail behind the traveler via 2D canvas (see drawTraceOverlay in JourneyMap.tsx) —
+   renders reliably regardless of WebGL layer support. Sits above the MapLibre canvas, below
+   markers/UI. MapLibre's own canvas/marker/popup elements use z-index:auto, so without an
+   explicit z-index here the trace canvas (a sibling of the map container, not a descendant)
+   would paint above everything rather than only above the basemap; bump markers/popups to match. */
 .trace-overlay-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
 .maplibregl-marker { z-index: 5; }
 .maplibregl-popup { z-index: 6; }
@@ -322,7 +322,12 @@ td em { color: #a0a7a2; font-style: normal; }
 .speed-label { font-size: 9px; font-weight: 800; color: var(--muted); text-transform: uppercase; margin-right: 2px; }
 .speed-btn { border: 0; background: transparent; padding: 3px 7px; font-size: 10px; font-weight: 800; border-radius: 5px; color: var(--muted); transition: all 0.15s ease; }
 .speed-btn.active { background: white; color: var(--green); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1); }
-.fit-btn, .fullscreen-btn, .export-btn { font-size: 10px; }
+.camera-mode-selector { display: flex; align-items: center; gap: 2px; background: #e8eee8; padding: 3px 5px; border-radius: 7px; }
+.camera-mode-btn { display: inline-flex; align-items: center; gap: 5px; border: 0; background: transparent; padding: 4px 9px; font-size: 10px; font-weight: 800; border-radius: 5px; color: var(--muted); transition: all 0.15s ease; }
+.camera-mode-btn:hover:not(:disabled):not(.active) { color: var(--green); }
+.camera-mode-btn.active { background: white; color: var(--green); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1); }
+.camera-mode-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.fullscreen-btn, .export-btn { font-size: 10px; }
 .export-btn.exporting { opacity: 0.6; cursor: progress; }
 
 /* Compact fullscreen overlay */

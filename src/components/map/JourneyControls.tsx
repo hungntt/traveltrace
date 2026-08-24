@@ -1,5 +1,6 @@
 "use client";
 
+import type { CameraMode } from "./JourneyMap";
 import type { TravelPlace } from "@/types/import";
 
 export interface JourneyControlsProps {
@@ -12,6 +13,7 @@ export interface JourneyControlsProps {
   destinationStopIndex: number;
   arrivedStopIndex: number | null;
   animationReady?: boolean;
+  cameraMode: CameraMode;
   compact?: boolean;
   isFullscreen?: boolean;
   isExporting?: boolean;
@@ -22,7 +24,8 @@ export interface JourneyControlsProps {
   onNext: () => void;
   onSeek: (targetProgress: number) => void;
   onSpeedChange: (speed: number) => void;
-  onFitJourney: () => void;
+  onFollowCamera: () => void;
+  onFixedCamera: () => void;
   onToggleFullscreen?: () => void;
   onExportVideo?: () => void;
 }
@@ -37,6 +40,7 @@ export function JourneyControls({
   destinationStopIndex,
   arrivedStopIndex,
   animationReady = true,
+  cameraMode,
   compact = false,
   isFullscreen = false,
   isExporting = false,
@@ -47,7 +51,8 @@ export function JourneyControls({
   onNext,
   onSeek,
   onSpeedChange,
-  onFitJourney,
+  onFollowCamera,
+  onFixedCamera,
   onToggleFullscreen,
   onExportVideo,
 }: JourneyControlsProps) {
@@ -258,23 +263,39 @@ export function JourneyControls({
             ))}
           </div>
 
+          {/* Camera mode: follow the traveler, or hold the whole journey in view */}
+          <div className="camera-mode-selector" role="group" aria-label="Camera mode">
+            <button
+              type="button"
+              className={`camera-mode-btn ${cameraMode === "follow" ? "active" : ""}`}
+              onClick={onFollowCamera}
+              disabled={!animationReady}
+              aria-pressed={cameraMode === "follow"}
+              title="Camera follows the traveler"
+            >
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M12 2v3m0 14v3M2 12h3m14 0h3" />
+              </svg>
+              <span>Follow Camera</span>
+            </button>
+            <button
+              type="button"
+              className={`camera-mode-btn ${cameraMode === "fixed" ? "active" : ""}`}
+              onClick={onFixedCamera}
+              disabled={!animationReady}
+              aria-pressed={cameraMode === "fixed"}
+              title="Hold the whole journey in view"
+            >
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+              </svg>
+              <span>Fixed Map</span>
+            </button>
+          </div>
+
           {!compact && (
             <>
-              {/* Fit whole journey */}
-              <button
-                type="button"
-                className="ctrl-btn fit-btn"
-                onClick={onFitJourney}
-                disabled={!animationReady}
-                title="Fit whole journey in view"
-                aria-label="Fit whole journey in map view"
-              >
-                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
-                </svg>
-                <span>Fit Journey</span>
-              </button>
-
               {/* Export Video */}
               {onExportVideo && (
                 <button

@@ -179,8 +179,9 @@ export function prepareSegments(places: TravelPlace[]): PreparedSegment[] {
 }
 
 /**
- * Builds the complete rendered route from the geometry prepared once by
- * prepareSegments(). All map route states use these same coordinates.
+ * @deprecated Not used for rendering — getVisibleTrace() is the only trace the
+ * map draws. Kept for tests and non-rendering callers.
+ * Builds the complete route from the geometry prepared once by prepareSegments().
  */
 export function buildPreparedFullRouteFeatureCollection(
   preparedSegments: PreparedSegment[]
@@ -198,6 +199,84 @@ export function buildPreparedFullRouteFeatureCollection(
       },
     })),
   };
+}
+
+/**
+ * The single source of truth for the visible journey trace.
+ *
+ * Returns the geographic coordinates travelled from the journey start up to the
+ * traveler's current position — completed segments in full, then the current
+ * segment only as far as the traveler has actually flown. Future geometry is
+ * never included, coordinates shared by two adjacent segments are emitted once,
+ * and the final coordinate is exactly the position getTravelerState() reports
+ * for the same progress value.
+ */
+export function getVisibleTrace(
+  preparedSegments: PreparedSegment[],
+  progress: number
+): [number, number][] {
+  if (preparedSegments.length === 0) return [];
+
+  const maxProgress = preparedSegments.length;
+  const clampedProgress = Math.max(0, Math.min(maxProgress, progress));
+  if (clampedProgress <= 0) return [];
+
+  const coordinates: [number, number][] = [];
+  const push = (coord: [number, number]) => {
+    const last = coordinates[coordinates.length - 1];
+    if (last && last[0] === coord[0] && last[1] === coord[1]) return;
+    coordinates.push(coord);
+  };
+
+  const completedSegments = Math.min(Math.floor(clampedProgress), maxProgress);
+
+  for (let i = 0; i < completedSegments; i++) {
+    for (const sample of preparedSegments[i].unwrappedSamples) {
+      push(sample);
+    }
+  }
+
+  if (completedSegments < maxProgress) {
+    const samples = preparedSegments[completedSegments].unwrappedSamples;
+    const segmentFraction = clampedProgress - completedSegments;
+    const scaled = segmentFraction * (samples.length - 1);
+    const sampleIdx = Math.min(Math.floor(scaled), samples.length - 2);
+    const subFraction = scaled - sampleIdx;
+
+    for (let s = 0; s <= sampleIdx; s++) {
+      push(samples[s]);
+    }
+
+    // Same interpolation getTravelerState() uses, so the trace tip and the
+    // traveler marker land on the identical coordinate.
+    const pA = samples[sampleIdx];
+    const pB = samples[sampleIdx + 1];
+    push([
+      pA[0] + subFraction * (pB[0] - pA[0]),
+      pA[1] + subFraction * (pB[1] - pA[1]),
+    ]);
+  }
+
+  return coordinates;
+}
+
+/**
+ * Picks one stable zoom level for Follow Camera from the journey's average
+ * segment length, so the camera never zooms in and out per segment.
+ */
+export function getFollowZoom(preparedSegments: PreparedSegment[]): number {
+  if (preparedSegments.length === 0) return 10;
+
+  const totalKm = preparedSegments.reduce((sum, seg) => sum + seg.distanceKm, 0);
+  const averageKm = totalKm / preparedSegments.length;
+
+  if (averageKm < 3) return 12;
+  if (averageKm < 25) return 10;
+  if (averageKm < 150) return 8;
+  if (averageKm < 700) return 6;
+  if (averageKm < 2500) return 4.5;
+  if (averageKm < 7000) return 3.5;
+  return 2.75;
 }
 
 /**
@@ -311,8 +390,10 @@ export function buildProgressRouteGeoJSON(
 }
 
 /**
- * Optimized runtime progress route generator that reuses precomputed segments.
- * Performs zero Turf calculations for maximum frame rates.
+ * @deprecated Not used for rendering — the map draws one cumulative LineString
+ * from getVisibleTrace() instead of a completed/active split. Kept for tests and
+ * non-rendering callers.
+ * Progress route generator that reuses precomputed segments (zero Turf calls).
  */
 export function buildOptimizedProgressRoute(
   preparedSegments: PreparedSegment[],
