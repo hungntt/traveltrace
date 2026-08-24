@@ -12,6 +12,9 @@ export interface JourneyControlsProps {
   destinationStopIndex: number;
   arrivedStopIndex: number | null;
   animationReady?: boolean;
+  compact?: boolean;
+  isFullscreen?: boolean;
+  isExporting?: boolean;
   onPlay: () => void;
   onPause: () => void;
   onReplay: () => void;
@@ -20,6 +23,8 @@ export interface JourneyControlsProps {
   onSeek: (targetProgress: number) => void;
   onSpeedChange: (speed: number) => void;
   onFitJourney: () => void;
+  onToggleFullscreen?: () => void;
+  onExportVideo?: () => void;
 }
 
 export function JourneyControls({
@@ -32,6 +37,9 @@ export function JourneyControls({
   destinationStopIndex,
   arrivedStopIndex,
   animationReady = true,
+  compact = false,
+  isFullscreen = false,
+  isExporting = false,
   onPlay,
   onPause,
   onReplay,
@@ -40,6 +48,8 @@ export function JourneyControls({
   onSeek,
   onSpeedChange,
   onFitJourney,
+  onToggleFullscreen,
+  onExportVideo,
 }: JourneyControlsProps) {
   const totalStops = places.length;
   const isSingleStop = totalStops <= 1;
@@ -61,84 +71,94 @@ export function JourneyControls({
       })
     : null;
 
+  const compactLabel = isTransit
+    ? `${places[departedStopIndex]?.name ?? ""} → ${places[destinationStopIndex]?.name ?? ""}`
+    : activePlace?.name ?? "";
+
   return (
-    <div className="journey-controls-panel">
-      {/* Current Stop Header Card */}
-      {activePlace && (
-        <div className="current-stop-card">
-          <div className="stop-badge">
-            <span className={`stop-index ${isTransit ? "in-transit" : ""}`}>
-              {isSingleStop
-                ? "Stop 1 of 1"
-                : isTransit
-                ? `Traveling to Stop ${destinationStopIndex + 1} of ${totalStops}`
-                : `Stop ${(arrivedStopIndex ?? displayIndex) + 1} of ${totalStops}`}
-            </span>
-            {formattedDate && <span className="stop-date">{formattedDate}</span>}
+    <div className={`journey-controls-panel ${compact ? "compact" : ""}`}>
+      {compact ? (
+        activePlace && <p className="compact-current-place">{compactLabel}</p>
+      ) : (
+        <>
+          {/* Current Stop Header Card */}
+          {activePlace && (
+            <div className="current-stop-card">
+              <div className="stop-badge">
+                <span className={`stop-index ${isTransit ? "in-transit" : ""}`}>
+                  {isSingleStop
+                    ? "Stop 1 of 1"
+                    : isTransit
+                    ? `Traveling to Stop ${destinationStopIndex + 1} of ${totalStops}`
+                    : `Stop ${(arrivedStopIndex ?? displayIndex) + 1} of ${totalStops}`}
+                </span>
+                {formattedDate && <span className="stop-date">{formattedDate}</span>}
+              </div>
+              <div className="stop-details">
+                <h3 className="stop-name">{activePlace.name}</h3>
+                {activePlace.address && (
+                  <p className="stop-address">{activePlace.address}</p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Scrubber Timeline */}
+          <div className="timeline-container">
+            <div className="timeline-labels">
+              <span>{places[0]?.name ?? "Start"}</span>
+              <span>{places[totalStops - 1]?.name ?? "End"}</span>
+            </div>
+            <div className="timeline-track-wrap">
+              <input
+                type="range"
+                min={0}
+                max={Math.max(1, maxProgress)}
+                step={0.005}
+                value={isSingleStop ? 0 : progress}
+                onChange={(e) => onSeek(parseFloat(e.target.value))}
+                disabled={isControlDisabled}
+                aria-label="Journey timeline scrubber"
+                className="timeline-slider"
+                style={
+                  {
+                    "--progress-pct": isSingleStop
+                      ? "100%"
+                      : `${(progress / maxProgress) * 100}%`,
+                  } as React.CSSProperties
+                }
+              />
+              <div className="timeline-stop-dots" aria-hidden="true">
+                {places.map((place, idx) => {
+                  const isReached = isTransit
+                    ? idx <= departedStopIndex
+                    : idx <= (arrivedStopIndex ?? displayIndex);
+                  const isActive = isTransit
+                    ? idx === destinationStopIndex
+                    : idx === (arrivedStopIndex ?? displayIndex);
+                  const isTarget = isTransit && idx === destinationStopIndex;
+
+                  return (
+                    <span
+                      key={place.id}
+                      className={`timeline-dot ${isReached ? "reached" : ""} ${
+                        isActive ? "active" : ""
+                      } ${isTarget ? "target-dot" : ""}`}
+                      style={{
+                        left:
+                          maxProgress === 0
+                            ? "50%"
+                            : `${(idx / maxProgress) * 100}%`,
+                      }}
+                      title={`${idx + 1}. ${place.name}`}
+                    />
+                  );
+                })}
+              </div>
+            </div>
           </div>
-          <div className="stop-details">
-            <h3 className="stop-name">{activePlace.name}</h3>
-            {activePlace.address && (
-              <p className="stop-address">{activePlace.address}</p>
-            )}
-          </div>
-        </div>
+        </>
       )}
-
-      {/* Scrubber Timeline */}
-      <div className="timeline-container">
-        <div className="timeline-labels">
-          <span>{places[0]?.name ?? "Start"}</span>
-          <span>{places[totalStops - 1]?.name ?? "End"}</span>
-        </div>
-        <div className="timeline-track-wrap">
-          <input
-            type="range"
-            min={0}
-            max={Math.max(1, maxProgress)}
-            step={0.005}
-            value={isSingleStop ? 0 : progress}
-            onChange={(e) => onSeek(parseFloat(e.target.value))}
-            disabled={isControlDisabled}
-            aria-label="Journey timeline scrubber"
-            className="timeline-slider"
-            style={
-              {
-                "--progress-pct": isSingleStop
-                  ? "100%"
-                  : `${(progress / maxProgress) * 100}%`,
-              } as React.CSSProperties
-            }
-          />
-          <div className="timeline-stop-dots" aria-hidden="true">
-            {places.map((place, idx) => {
-              const isReached = isTransit
-                ? idx <= departedStopIndex
-                : idx <= (arrivedStopIndex ?? displayIndex);
-              const isActive = isTransit
-                ? idx === destinationStopIndex
-                : idx === (arrivedStopIndex ?? displayIndex);
-              const isTarget = isTransit && idx === destinationStopIndex;
-
-              return (
-                <span
-                  key={place.id}
-                  className={`timeline-dot ${isReached ? "reached" : ""} ${
-                    isActive ? "active" : ""
-                  } ${isTarget ? "target-dot" : ""}`}
-                  style={{
-                    left:
-                      maxProgress === 0
-                        ? "50%"
-                        : `${(idx / maxProgress) * 100}%`,
-                  }}
-                  title={`${idx + 1}. ${place.name}`}
-                />
-              );
-            })}
-          </div>
-        </div>
-      </div>
 
       {/* Main Buttons and Speed */}
       <div className="controls-action-bar">
@@ -159,20 +179,24 @@ export function JourneyControls({
             <span className="ctrl-btn-text">Replay</span>
           </button>
 
-          {/* Previous */}
-          <button
-            type="button"
-            className="ctrl-btn"
-            onClick={onPrev}
-            disabled={isControlDisabled || progress <= 0}
-            title="Previous destination"
-            aria-label="Jump to previous destination"
-          >
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
-              <polygon points="19 20 9 12 19 4 19 20" />
-              <line x1="5" y1="19" x2="5" y2="5" />
-            </svg>
-          </button>
+          {!compact && (
+            <>
+              {/* Previous */}
+              <button
+                type="button"
+                className="ctrl-btn"
+                onClick={onPrev}
+                disabled={isControlDisabled || progress <= 0}
+                title="Previous destination"
+                aria-label="Jump to previous destination"
+              >
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
+                  <polygon points="19 20 9 12 19 4 19 20" />
+                  <line x1="5" y1="19" x2="5" y2="5" />
+                </svg>
+              </button>
+            </>
+          )}
 
           {/* Play / Pause */}
           <button
@@ -196,26 +220,30 @@ export function JourneyControls({
             <span>{isPlaying ? "Pause" : "Play"}</span>
           </button>
 
-          {/* Next */}
-          <button
-            type="button"
-            className="ctrl-btn"
-            onClick={onNext}
-            disabled={isControlDisabled || progress >= maxProgress}
-            title="Next destination"
-            aria-label="Jump to next destination"
-          >
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
-              <polygon points="5 4 15 12 5 20 5 4" />
-              <line x1="19" y1="5" x2="19" y2="19" />
-            </svg>
-          </button>
+          {!compact && (
+            <>
+              {/* Next */}
+              <button
+                type="button"
+                className="ctrl-btn"
+                onClick={onNext}
+                disabled={isControlDisabled || progress >= maxProgress}
+                title="Next destination"
+                aria-label="Jump to next destination"
+              >
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2">
+                  <polygon points="5 4 15 12 5 20 5 4" />
+                  <line x1="19" y1="5" x2="19" y2="19" />
+                </svg>
+              </button>
+            </>
+          )}
         </div>
 
-        {/* Speed Selector & Fit Journey */}
+        {/* Speed Selector & Secondary Actions */}
         <div className="secondary-controls">
           <div className="speed-selector" role="group" aria-label="Playback speed">
-            <span className="speed-label">Speed:</span>
+            {!compact && <span className="speed-label">Speed:</span>}
             {[0.5, 1, 2].map((s) => (
               <button
                 key={s}
@@ -230,20 +258,65 @@ export function JourneyControls({
             ))}
           </div>
 
-          {/* Fit whole journey */}
-          <button
-            type="button"
-            className="ctrl-btn fit-btn"
-            onClick={onFitJourney}
-            disabled={!animationReady}
-            title="Fit whole journey in view"
-            aria-label="Fit whole journey in map view"
-          >
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
-            </svg>
-            <span>Fit Journey</span>
-          </button>
+          {!compact && (
+            <>
+              {/* Fit whole journey */}
+              <button
+                type="button"
+                className="ctrl-btn fit-btn"
+                onClick={onFitJourney}
+                disabled={!animationReady}
+                title="Fit whole journey in view"
+                aria-label="Fit whole journey in map view"
+              >
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+                </svg>
+                <span>Fit Journey</span>
+              </button>
+
+              {/* Export Video */}
+              {onExportVideo && (
+                <button
+                  type="button"
+                  className={`ctrl-btn export-btn ${isExporting ? "exporting" : ""}`}
+                  onClick={onExportVideo}
+                  disabled={isControlDisabled || isExporting}
+                  title="Export journey as a video"
+                  aria-label="Export journey animation as a video"
+                >
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
+                    <rect x="2" y="5" width="15" height="14" rx="2" />
+                    <path d="M17 9.5 22 6v12l-5-3.5" />
+                  </svg>
+                  <span>{isExporting ? "Exporting…" : "Export Video"}</span>
+                </button>
+              )}
+            </>
+          )}
+
+          {/* Fullscreen toggle */}
+          {onToggleFullscreen && (
+            <button
+              type="button"
+              className="ctrl-btn fullscreen-btn"
+              onClick={onToggleFullscreen}
+              disabled={!animationReady}
+              title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+              aria-label={isFullscreen ? "Exit fullscreen mode" : "Enter fullscreen mode"}
+            >
+              {isFullscreen ? (
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M9 3v4a2 2 0 0 1-2 2H3m18 0h-4a2 2 0 0 1-2-2V3m0 18v-4a2 2 0 0 1 2-2h4M3 15h4a2 2 0 0 1 2 2v4" />
+                </svg>
+              ) : (
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+                </svg>
+              )}
+              <span>{isFullscreen ? "Exit Fullscreen" : "Fullscreen"}</span>
+            </button>
+          )}
         </div>
       </div>
     </div>

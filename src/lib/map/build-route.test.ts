@@ -4,11 +4,13 @@ import {
   buildFullRouteFeatureCollection,
   buildGreatCircleSegment,
   buildOptimizedProgressRoute,
+  buildPreparedFullRouteFeatureCollection,
   buildProgressRouteGeoJSON,
   calculateBearing,
   calculateTotalRouteDistance,
   formatDistance,
   getJourneyBounds,
+  getPreparedRouteBounds,
   getTravelerState,
   intermediatePoint,
   prepareSegments,
@@ -128,8 +130,7 @@ describe("build-route utilities", () => {
       const segs = prepareSegments(samplePlaces);
       expect(segs).toHaveLength(2);
       expect(segs[0].distanceKm).toBeGreaterThan(5000);
-      expect(segs[0].samples.length).toBeGreaterThan(50);
-      expect(segs[0].unwrappedSamples.length).toBe(segs[0].samples.length);
+      expect(segs[0].unwrappedSamples.length).toBe(129);
     });
 
     it("should build optimized progress routes identical to standard routes", () => {
@@ -168,6 +169,24 @@ describe("build-route utilities", () => {
       expect(collection.features).toHaveLength(2);
       expect(collection.features[0].properties?.segmentIndex).toBe(0);
       expect(collection.features[1].properties?.segmentIndex).toBe(1);
+    });
+  });
+
+  describe("prepared route geometry is the rendering source of truth", () => {
+    it("uses each segment exact sampled coordinate array for the full and completed routes", () => {
+      const prepared = prepareSegments(samplePlaces);
+      const fullRoute = buildPreparedFullRouteFeatureCollection(prepared);
+      const completedRoute = buildOptimizedProgressRoute(prepared, prepared.length);
+
+      expect(fullRoute.features).toHaveLength(prepared.length);
+      for (let index = 0; index < prepared.length; index++) {
+        expect(fullRoute.features[index].geometry.coordinates).toBe(
+          prepared[index].unwrappedSamples
+        );
+        expect(completedRoute.completedGeoJson.features[index].geometry.coordinates).toBe(
+          prepared[index].unwrappedSamples
+        );
+      }
     });
   });
 
@@ -334,6 +353,70 @@ describe("build-route utilities", () => {
     });
   });
 
+  describe("route state transitions stay on identical coordinates", () => {
+    it("changes an arriving segment from active to completed without geometry drift", () => {
+      const prepared = prepareSegments(samplePlaces.slice(0, 2));
+      const almostArrived = buildOptimizedProgressRoute(prepared, 0.999999);
+      const arrived = buildOptimizedProgressRoute(prepared, 1);
+      const activeCoordinates = almostArrived.activeGeoJson.features[0].geometry.coordinates;
+      const completedCoordinates = arrived.completedGeoJson.features[0].geometry.coordinates;
+
+      expect(activeCoordinates.slice(0, -1)).toEqual(
+        completedCoordinates.slice(0, activeCoordinates.length - 1)
+      );
+      expect(activeCoordinates.at(-1)?.[0]).toBeCloseTo(completedCoordinates.at(-1)![0], 3);
+      expect(activeCoordinates.at(-1)?.[1]).toBeCloseTo(completedCoordinates.at(-1)![1], 3);
+    });
+
+    it("keeps adjacent prepared segments in the same continuous world copy", () => {
+      const prepared = prepareSegments([
+        { id: "t", name: "Tokyo", longitude: 139.69, latitude: 35.68, originalIndex: 0, journeyIndex: 0 },
+        { id: "h", name: "Honolulu", longitude: -157.85, latitude: 21.30, originalIndex: 1, journeyIndex: 1 },
+        { id: "s", name: "San Francisco", longitude: -122.42, latitude: 37.77, originalIndex: 2, journeyIndex: 2 },
+      ]);
+
+      expect(prepared[1].unwrappedSamples[0]).toEqual(prepared[0].unwrappedSamples.at(-1));
+    });
+  });
+
+  describe("getPreparedRouteBounds", () => {
+    it("includes the northern great-circle curve for Tokyo to Paris", () => {
+      const tokyoParis = samplePlaces.slice(0, 2);
+      const prepared = prepareSegments(tokyoParis);
+      const [[minLng, minLat], [maxLng, maxLat]] = getPreparedRouteBounds(
+        prepared,
+        tokyoParis
+      );
+      const highestEndpointLatitude = Math.max(...tokyoParis.map((place) => place.latitude));
+
+      expect(minLng).toBeLessThanOrEqual(2.3522);
+      expect(maxLng).toBeGreaterThanOrEqual(139.6503);
+      expect(minLat).toBeLessThanOrEqual(35.6762);
+      expect(maxLat).toBeGreaterThan(highestEndpointLatitude + 10);
+    });
+
+    it("keeps Tokyo to Honolulu in the Pacific world copy", () => {
+      const tokyoHonolulu: TravelPlace[] = [
+        { id: "t1", name: "Tokyo", longitude: 139.69, latitude: 35.68, originalIndex: 0, journeyIndex: 0 },
+        { id: "h1", name: "Honolulu", longitude: -157.85, latitude: 21.30, originalIndex: 1, journeyIndex: 1 },
+      ];
+      const prepared = prepareSegments(tokyoHonolulu);
+      const [[minLng], [maxLng]] = getPreparedRouteBounds(prepared, tokyoHonolulu);
+      const finalCoordinate = prepared[0].unwrappedSamples.at(-1);
+      const finalTraveler = getTravelerState(tokyoHonolulu, 1, prepared);
+
+      expect(maxLng - minLng).toBeLessThan(100);
+      expect(finalCoordinate?.[0]).toBeCloseTo(202.15, 2);
+      expect(finalTraveler?.position).toEqual(finalCoordinate);
+    });
+
+    it("preserves the padded point bounds for a one-stop journey", () => {
+      expect(getPreparedRouteBounds([], [samplePlaces[0]])).toEqual(
+        getJourneyBounds([samplePlaces[0]])
+      );
+    });
+  });
+
   describe("Phase 2 & 10 Manual Visual Proof: Two-Stop Tokyo -> Paris seeking", () => {
     const tokyoParis: TravelPlace[] = [
       { id: "p1", name: "Tokyo", latitude: 35.6762, longitude: 139.6503, originalIndex: 0, journeyIndex: 0 },
@@ -343,7 +426,7 @@ describe("build-route utilities", () => {
     it("should accurately move traveler and grow active route across seek fractions [0, 0.25, 0.5, 0.75, 1.0]", () => {
       const prepared = prepareSegments(tokyoParis);
       expect(prepared).toHaveLength(1);
-      expect(prepared[0].samples.length).toBe(129); // 128 intervals + 1 point
+      expect(prepared[0].unwrappedSamples.length).toBe(129); // 128 intervals + 1 point
 
       // seekTo(0)
       const state0 = getTravelerState(tokyoParis, 0, prepared);
@@ -471,7 +554,7 @@ describe("build-route utilities", () => {
 
     it("should follow the complete progression lifecycle: Future -> Active Growing -> Completed Green", () => {
       const prepared = prepareSegments(places);
-      const fullRoute = buildFullRouteFeatureCollection(places);
+      const fullRoute = buildPreparedFullRouteFeatureCollection(prepared);
 
       // Future route has all segments
       expect(fullRoute.features).toHaveLength(2);

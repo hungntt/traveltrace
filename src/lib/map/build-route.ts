@@ -18,9 +18,7 @@ export interface PreparedSegment {
   p1: [number, number];
   p2: [number, number];
   distanceKm: number;
-  samples: [number, number][];
   unwrappedSamples: [number, number][];
-  fullFeature: Feature<LineString | MultiLineString>;
 }
 
 /**
@@ -142,6 +140,7 @@ export function prepareSegments(places: TravelPlace[]): PreparedSegment[] {
 
   const segments: PreparedSegment[] = [];
   const SAMPLES_PER_SEGMENT = 128;
+  let routeReferenceLng: number | null = null;
 
   for (let i = 0; i < places.length - 1; i++) {
     const p1: [number, number] = [places[i].longitude, places[i].latitude];
@@ -151,31 +150,28 @@ export function prepareSegments(places: TravelPlace[]): PreparedSegment[] {
     const pt2 = turf.point(p2);
     const distanceKm = turf.distance(pt1, pt2, { units: "kilometers" });
 
-    const samples: [number, number][] = [];
     const unwrappedSamples: [number, number][] = [];
 
-    let prevLng = p1[0];
+    // Keep every segment in one continuous world copy so a segment endpoint
+    // is the exact start of the next segment, including at the antimeridian.
+    let prevLng = routeReferenceLng ?? p1[0];
 
     for (let s = 0; s <= SAMPLES_PER_SEGMENT; s++) {
       const fraction = s / SAMPLES_PER_SEGMENT;
       const pt = intermediatePoint(p1, p2, fraction);
-      samples.push(pt);
-
       const uLng = unwrapLongitude(pt[0], prevLng);
       unwrappedSamples.push([uLng, pt[1]]);
       prevLng = uLng;
     }
 
-    const fullFeature = buildGreatCircleSegment(p1, p2, i);
+    routeReferenceLng = unwrappedSamples[unwrappedSamples.length - 1][0];
 
     segments.push({
       segmentIndex: i,
       p1,
       p2,
       distanceKm,
-      samples,
       unwrappedSamples,
-      fullFeature,
     });
   }
 
@@ -183,7 +179,30 @@ export function prepareSegments(places: TravelPlace[]): PreparedSegment[] {
 }
 
 /**
- * Generates full GeoJSON line features for all segments connecting the ordered places.
+ * Builds the complete rendered route from the geometry prepared once by
+ * prepareSegments(). All map route states use these same coordinates.
+ */
+export function buildPreparedFullRouteFeatureCollection(
+  preparedSegments: PreparedSegment[]
+): FeatureCollection<LineString> {
+  return {
+    type: "FeatureCollection",
+    features: preparedSegments.map((segment) => ({
+      type: "Feature",
+      properties: {
+        segmentIndex: segment.segmentIndex,
+      },
+      geometry: {
+        type: "LineString",
+        coordinates: segment.unwrappedSamples,
+      },
+    })),
+  };
+}
+
+/**
+ * @deprecated Rendering must use buildPreparedFullRouteFeatureCollection().
+ * Generates standalone Turf geometry only for non-rendering legacy callers.
  */
 export function buildFullRouteFeatureCollection(
   places: TravelPlace[]
@@ -210,7 +229,8 @@ export function buildFullRouteFeatureCollection(
 }
 
 /**
- * Generates completed route and active segment GeoJSON for a given playback progress.
+ * @deprecated Rendering must use buildOptimizedProgressRoute() with prepared segments.
+ * Generates standalone Turf geometry only for non-rendering legacy callers.
  * progress is a floating number from 0 to (places.length - 1).
  */
 export function buildProgressRouteGeoJSON(
@@ -298,8 +318,8 @@ export function buildOptimizedProgressRoute(
   preparedSegments: PreparedSegment[],
   progress: number
 ): {
-  completedGeoJson: FeatureCollection<LineString | MultiLineString>;
-  activeGeoJson: FeatureCollection<LineString | MultiLineString>;
+  completedGeoJson: FeatureCollection<LineString>;
+  activeGeoJson: FeatureCollection<LineString>;
 } {
   if (preparedSegments.length === 0 || progress <= 0) {
     return {
@@ -315,7 +335,7 @@ export function buildOptimizedProgressRoute(
     return {
       completedGeoJson: {
         type: "FeatureCollection",
-        features: preparedSegments.map((s) => s.fullFeature),
+        features: buildPreparedFullRouteFeatureCollection(preparedSegments).features,
       },
       activeGeoJson: {
         type: "FeatureCollection",
@@ -330,15 +350,14 @@ export function buildOptimizedProgressRoute(
   );
   const segmentFraction = clampedProgress - currentSegmentIndex;
 
-  const completedFeatures: Feature<LineString | MultiLineString>[] = [];
-  for (let i = 0; i < currentSegmentIndex; i++) {
-    completedFeatures.push(preparedSegments[i].fullFeature);
-  }
+  const completedFeatures = buildPreparedFullRouteFeatureCollection(
+    preparedSegments.slice(0, currentSegmentIndex)
+  ).features;
 
-  const activeFeatures: Feature<LineString | MultiLineString>[] = [];
+  const activeFeatures: Feature<LineString>[] = [];
   if (segmentFraction > 0.0001) {
     const curSeg = preparedSegments[currentSegmentIndex];
-    const samples = curSeg.unwrappedSamples?.length ? curSeg.unwrappedSamples : curSeg.samples;
+    const samples = curSeg.unwrappedSamples;
     const scaled = segmentFraction * (samples.length - 1);
     const sampleIdx = Math.min(Math.floor(scaled), samples.length - 2);
     const subFraction = scaled - sampleIdx;
@@ -410,8 +429,15 @@ export function getTravelerState(
   const clampedProgress = Math.max(0, Math.min(maxProgress, progress));
 
   if (clampedProgress <= 0) {
-    const p1: [number, number] = [places[0].longitude, places[0].latitude];
-    const p2: [number, number] = [places[1].longitude, places[1].latitude];
+    const firstSamples = preparedSegments?.[0]?.unwrappedSamples;
+    const p1: [number, number] = firstSamples?.[0] ?? [
+      places[0].longitude,
+      places[0].latitude,
+    ];
+    const p2: [number, number] = firstSamples?.[1] ?? [
+      places[1].longitude,
+      places[1].latitude,
+    ];
     return {
       position: p1,
       bearing: calculateBearing(p1, p2),
@@ -425,11 +451,12 @@ export function getTravelerState(
   }
 
   if (clampedProgress >= maxProgress) {
-    const pLastPrev: [number, number] = [
+    const finalSamples = preparedSegments?.[preparedSegments.length - 1]?.unwrappedSamples;
+    const pLastPrev: [number, number] = finalSamples?.[finalSamples.length - 2] ?? [
       places[places.length - 2].longitude,
       places[places.length - 2].latitude,
     ];
-    const pLast: [number, number] = [
+    const pLast: [number, number] = finalSamples?.[finalSamples.length - 1] ?? [
       places[places.length - 1].longitude,
       places[places.length - 1].latitude,
     ];
@@ -452,8 +479,8 @@ export function getTravelerState(
   let bearing: number;
 
   const seg = preparedSegments && preparedSegments[currentSegmentIndex];
-  if (seg && (seg.unwrappedSamples?.length ?? seg.samples?.length) >= 2) {
-    const samples = seg.unwrappedSamples?.length ? seg.unwrappedSamples : seg.samples;
+  if (seg && seg.unwrappedSamples.length >= 2) {
+    const samples = seg.unwrappedSamples;
     const scaled = segmentFraction * (samples.length - 1);
     const sampleIdx = Math.min(Math.floor(scaled), samples.length - 2);
     const subFraction = scaled - sampleIdx;
@@ -598,5 +625,49 @@ export function getJourneyBounds(
   return [
     [startLng, minLat],
     [endLng, maxLat],
+  ];
+}
+
+/**
+ * Computes bounds from the exact sampled geometry rendered by MapLibre.
+ * A single-stop journey retains the existing point-padding behavior.
+ */
+export function getPreparedRouteBounds(
+  preparedSegments: PreparedSegment[],
+  places: TravelPlace[] = []
+): [[number, number], [number, number]] {
+  if (preparedSegments.length === 0) {
+    return getJourneyBounds(places);
+  }
+
+  const coordinates = preparedSegments.flatMap((segment) => segment.unwrappedSamples);
+  if (coordinates.length === 0) {
+    return getJourneyBounds(places);
+  }
+
+  let minLng = coordinates[0][0];
+  let maxLng = coordinates[0][0];
+  let minLat = coordinates[0][1];
+  let maxLat = coordinates[0][1];
+
+  for (const [lng, lat] of coordinates) {
+    minLng = Math.min(minLng, lng);
+    maxLng = Math.max(maxLng, lng);
+    minLat = Math.min(minLat, lat);
+    maxLat = Math.max(maxLat, lat);
+  }
+
+  if (minLng === maxLng) {
+    minLng -= 0.05;
+    maxLng += 0.05;
+  }
+  if (minLat === maxLat) {
+    minLat -= 0.05;
+    maxLat += 0.05;
+  }
+
+  return [
+    [minLng, minLat],
+    [maxLng, maxLat],
   ];
 }
