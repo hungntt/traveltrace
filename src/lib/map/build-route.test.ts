@@ -5,6 +5,8 @@ import {
   buildGreatCircleSegment,
   buildProgressRouteGeoJSON,
   calculateBearing,
+  calculateTotalRouteDistance,
+  formatDistance,
   getJourneyBounds,
   getTravelerState,
   intermediatePoint,
@@ -79,13 +81,20 @@ describe("build-route utilities", () => {
       // Due West
       expect(calculateBearing([0, 0], [-10, 0])).toBeCloseTo(270, 1);
     });
+
+    it("should return 0 for identical coordinates without NaN", () => {
+      expect(calculateBearing([139.65, 35.67], [139.65, 35.67])).toBe(0);
+    });
   });
 
   describe("buildGreatCircleSegment", () => {
-    it("should create line segment for short distance", () => {
+    it("should create line segment for short distance or identical points", () => {
       const seg = buildGreatCircleSegment([10, 10], [10.0001, 10.0001], 0);
       expect(seg.geometry.type).toBe("LineString");
       expect(seg.properties?.segmentIndex).toBe(0);
+
+      const identical = buildGreatCircleSegment([10, 10], [10, 10], 0);
+      expect(identical.geometry.type).toBe("LineString");
     });
 
     it("should create great circle arc for long distance", () => {
@@ -108,27 +117,45 @@ describe("build-route utilities", () => {
     });
   });
 
-  describe("buildProgressRouteGeoJSON", () => {
-    it("should handle progress 0", () => {
+  describe("buildProgressRouteGeoJSON regression tests", () => {
+    it("should handle progress 0: completed empty, active empty", () => {
       const { completedGeoJson, activeGeoJson } = buildProgressRouteGeoJSON(samplePlaces, 0);
       expect(completedGeoJson.features).toHaveLength(0);
       expect(activeGeoJson.features).toHaveLength(0);
     });
 
-    it("should handle mid-segment progress (e.g. 0.5)", () => {
+    it("should handle progress 0.5: completed empty, active segment 0 partial", () => {
       const { completedGeoJson, activeGeoJson } = buildProgressRouteGeoJSON(samplePlaces, 0.5);
       expect(completedGeoJson.features).toHaveLength(0);
       expect(activeGeoJson.features).toHaveLength(1);
+      expect(activeGeoJson.features[0].properties?.segmentIndex).toBe(0);
     });
 
-    it("should handle multi-segment progress (e.g. 1.5)", () => {
+    it("should handle progress 1.0: completed segment 0, active empty", () => {
+      const { completedGeoJson, activeGeoJson } = buildProgressRouteGeoJSON(samplePlaces, 1.0);
+      expect(completedGeoJson.features).toHaveLength(1);
+      expect(completedGeoJson.features[0].properties?.segmentIndex).toBe(0);
+      expect(activeGeoJson.features).toHaveLength(0);
+    });
+
+    it("should handle progress 1.5: completed segment 0, active segment 1 partial", () => {
       const { completedGeoJson, activeGeoJson } = buildProgressRouteGeoJSON(samplePlaces, 1.5);
-      expect(completedGeoJson.features).toHaveLength(1); // segment 0 completed
-      expect(activeGeoJson.features).toHaveLength(1); // segment 1 active
+      expect(completedGeoJson.features).toHaveLength(1);
+      expect(completedGeoJson.features[0].properties?.segmentIndex).toBe(0);
+      expect(activeGeoJson.features).toHaveLength(1);
+      expect(activeGeoJson.features[0].properties?.segmentIndex).toBe(1);
+    });
+
+    it("should handle FINAL progress (2.0): all segments completed, active route is completely empty", () => {
+      const { completedGeoJson, activeGeoJson } = buildProgressRouteGeoJSON(samplePlaces, 2.0);
+      expect(completedGeoJson.features).toHaveLength(2);
+      expect(completedGeoJson.features[0].properties?.segmentIndex).toBe(0);
+      expect(completedGeoJson.features[1].properties?.segmentIndex).toBe(1);
+      expect(activeGeoJson.features).toHaveLength(0);
     });
   });
 
-  describe("getTravelerState", () => {
+  describe("getTravelerState semantics", () => {
     it("should return null for empty places", () => {
       expect(getTravelerState([], 0)).toBeNull();
     });
@@ -137,20 +164,65 @@ describe("build-route utilities", () => {
       const state = getTravelerState([samplePlaces[0]], 0);
       expect(state).not.toBeNull();
       expect(state?.position).toEqual([samplePlaces[0].longitude, samplePlaces[0].latitude]);
-      expect(state?.currentStopIndex).toBe(0);
+      expect(state?.departedStopIndex).toBe(0);
+      expect(state?.destinationStopIndex).toBe(0);
+      expect(state?.arrivedStopIndex).toBe(0);
       expect(state?.isAtStop).toBe(true);
+      expect(state?.isTransit).toBe(false);
     });
 
-    it("should calculate traveler state at fractional progress", () => {
+    it("should return correct state at start (progress 0)", () => {
+      const state = getTravelerState(samplePlaces, 0);
+      expect(state?.departedStopIndex).toBe(0);
+      expect(state?.destinationStopIndex).toBe(1);
+      expect(state?.arrivedStopIndex).toBe(0);
+      expect(state?.isAtStop).toBe(true);
+      expect(state?.isTransit).toBe(false);
+    });
+
+    it("should return in-transit state mid-segment (progress 0.5)", () => {
       const state = getTravelerState(samplePlaces, 0.5);
-      expect(state).not.toBeNull();
-      expect(state?.progress).toBeCloseTo(0.5, 4);
-      expect(state?.bearing).toBeGreaterThanOrEqual(0);
-      expect(state?.bearing).toBeLessThanOrEqual(360);
+      expect(state?.departedStopIndex).toBe(0);
+      expect(state?.destinationStopIndex).toBe(1);
+      expect(state?.arrivedStopIndex).toBeNull();
+      expect(state?.isAtStop).toBe(false);
+      expect(state?.isTransit).toBe(true);
+    });
+
+    it("should return arrived state at stop 2 (progress 1.0)", () => {
+      const state = getTravelerState(samplePlaces, 1.0);
+      expect(state?.departedStopIndex).toBe(1);
+      expect(state?.destinationStopIndex).toBe(2);
+      expect(state?.arrivedStopIndex).toBe(1);
+      expect(state?.isAtStop).toBe(true);
+      expect(state?.isTransit).toBe(false);
+    });
+
+    it("should return arrived state at final destination (progress 2.0)", () => {
+      const state = getTravelerState(samplePlaces, 2.0);
+      expect(state?.departedStopIndex).toBe(1);
+      expect(state?.destinationStopIndex).toBe(2);
+      expect(state?.arrivedStopIndex).toBe(2);
+      expect(state?.isAtStop).toBe(true);
+      expect(state?.isTransit).toBe(false);
+      expect(state?.position[0]).toBeCloseTo(samplePlaces[2].longitude, 4);
+      expect(state?.position[1]).toBeCloseTo(samplePlaces[2].latitude, 4);
     });
   });
 
-  describe("getJourneyBounds", () => {
+  describe("distance calculations", () => {
+    it("should calculate total distance and format cleanly", () => {
+      expect(calculateTotalRouteDistance([])).toBe(0);
+      expect(calculateTotalRouteDistance([samplePlaces[0]])).toBe(0);
+
+      const totalKm = calculateTotalRouteDistance(samplePlaces);
+      expect(totalKm).toBeGreaterThan(10000);
+      const formatted = formatDistance(totalKm);
+      expect(formatted).toMatch(/^[0-9,]+ km$/);
+    });
+  });
+
+  describe("getJourneyBounds & antimeridian awareness", () => {
     it("should return default world bounds for empty array", () => {
       expect(getJourneyBounds([])).toEqual([
         [-180, -85],
@@ -164,14 +236,48 @@ describe("build-route utilities", () => {
       expect(bounds[1][0]).toBeGreaterThan(samplePlaces[0].longitude);
     });
 
-    it("should enclose all places", () => {
-      const [[minLng, minLat], [maxLng, maxLat]] = getJourneyBounds(samplePlaces);
-      for (const p of samplePlaces) {
-        expect(p.longitude).toBeGreaterThanOrEqual(minLng);
-        expect(p.longitude).toBeLessThanOrEqual(maxLng);
-        expect(p.latitude).toBeGreaterThanOrEqual(minLat);
-        expect(p.latitude).toBeLessThanOrEqual(maxLat);
-      }
+    it("should enclose ordinary route (Paris -> New York)", () => {
+      const parisNY: TravelPlace[] = [samplePlaces[1], samplePlaces[2]];
+      const [[minLng, minLat], [maxLng, maxLat]] = getJourneyBounds(parisNY);
+      expect(minLng).toBeCloseTo(-74.006, 1);
+      expect(maxLng).toBeCloseTo(2.352, 1);
+      expect(minLat).toBeCloseTo(40.7128, 1);
+      expect(maxLat).toBeCloseTo(48.8566, 1);
+    });
+
+    it("should handle dateline crossing route (Tokyo -> Honolulu) with minimal Pacific span", () => {
+      const tokyoHonolulu: TravelPlace[] = [
+        { id: "t1", name: "Tokyo", longitude: 139.69, latitude: 35.68, originalIndex: 0, journeyIndex: 0 },
+        { id: "h1", name: "Honolulu", longitude: -157.85, latitude: 21.30, originalIndex: 1, journeyIndex: 1 },
+      ];
+      const [[minLng], [maxLng]] = getJourneyBounds(tokyoHonolulu);
+      const span = maxLng - minLng;
+      // Shortest Pacific span is ~62.46 deg, NOT ~297.54 deg wrap across Europe
+      expect(span).toBeLessThan(100);
+      expect(span).toBeCloseTo(62.46, 1);
+    });
+
+    it("should handle Fiji -> Samoa dateline crossing cleanly", () => {
+      const fijiSamoa: TravelPlace[] = [
+        { id: "f1", name: "Fiji", longitude: 178.06, latitude: -18.14, originalIndex: 0, journeyIndex: 0 },
+        { id: "s1", name: "Samoa", longitude: -172.10, latitude: -13.83, originalIndex: 1, journeyIndex: 1 },
+      ];
+      const [[minLng], [maxLng]] = getJourneyBounds(fijiSamoa);
+      const span = maxLng - minLng;
+      expect(span).toBeLessThan(30);
+      expect(span).toBeCloseTo(9.84, 1);
+    });
+
+    it("should handle consecutive identical coordinates without crashing", () => {
+      const duplicates: TravelPlace[] = [
+        { id: "d1", name: "Spot A", longitude: 100, latitude: 20, originalIndex: 0, journeyIndex: 0 },
+        { id: "d2", name: "Spot A copy", longitude: 100, latitude: 20, originalIndex: 1, journeyIndex: 1 },
+      ];
+      const [[minLng, minLat], [maxLng, maxLat]] = getJourneyBounds(duplicates);
+      expect(minLng).toBeLessThan(100);
+      expect(maxLng).toBeGreaterThan(100);
+      expect(minLat).toBeLessThan(20);
+      expect(maxLat).toBeGreaterThan(20);
     });
   });
 });

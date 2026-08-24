@@ -30,6 +30,7 @@ export interface PlaceImportResult {
   totalFound: number;
   places: TravelPlace[];
   issues: ImportIssue[];
+  orderMode?: "manual" | "date";
 }
 
 export interface PlaceImporter {

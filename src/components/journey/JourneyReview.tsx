@@ -1,10 +1,10 @@
 "use client";
 
-import { movePlace, sortPlacesByDate, updatePlaceDate } from "@/lib/map/order";
+import { getOrderedPlaces, movePlace, updatePlaceDate } from "@/lib/map/order";
 import { JOURNEY_SESSION_KEY } from "@/lib/journey-storage";
 import type { PlaceImportResult, TravelPlace } from "@/types/import";
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 function CompassMark() {
   return (
@@ -19,12 +19,17 @@ function CompassMark() {
 export function JourneyReview() {
   const [result, setResult] = useState<PlaceImportResult | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [orderMode, setOrderMode] = useState<"manual" | "date">("manual");
 
   useEffect(() => {
     const stored = sessionStorage.getItem(JOURNEY_SESSION_KEY);
     if (stored) {
       try {
-        setResult(JSON.parse(stored) as PlaceImportResult);
+        const parsed = JSON.parse(stored) as PlaceImportResult;
+        setResult(parsed);
+        if (parsed.orderMode) {
+          setOrderMode(parsed.orderMode);
+        }
       } catch {
         sessionStorage.removeItem(JOURNEY_SESSION_KEY);
       }
@@ -32,41 +37,50 @@ export function JourneyReview() {
     setLoaded(true);
   }, []);
 
-  const savePlaces = (updatedPlaces: TravelPlace[]) => {
+  const saveJourneyData = (
+    updatedPlaces: TravelPlace[],
+    mode: "manual" | "date" = orderMode
+  ) => {
     if (!result) return;
     const updatedResult: PlaceImportResult = {
       ...result,
       places: updatedPlaces,
+      orderMode: mode,
     };
     setResult(updatedResult);
     sessionStorage.setItem(JOURNEY_SESSION_KEY, JSON.stringify(updatedResult));
   };
 
+  const handleOrderModeChange = (newMode: "manual" | "date") => {
+    setOrderMode(newMode);
+    if (result) {
+      saveJourneyData(result.places, newMode);
+    }
+  };
+
   const handleMoveUp = (index: number) => {
-    if (!result || index <= 0) return;
+    if (!result || index <= 0 || orderMode === "date") return;
     const updated = movePlace(result.places, index, index - 1);
-    savePlaces(updated);
+    saveJourneyData(updated);
   };
 
   const handleMoveDown = (index: number) => {
-    if (!result || index >= result.places.length - 1) return;
+    if (!result || index >= result.places.length - 1 || orderMode === "date") return;
     const updated = movePlace(result.places, index, index + 1);
-    savePlaces(updated);
+    saveJourneyData(updated);
   };
 
   const handleDateChange = (placeId: string, value: string) => {
     if (!result) return;
     const updated = updatePlaceDate(result.places, placeId, value);
-    savePlaces(updated);
+    saveJourneyData(updated);
   };
 
-  const handleSortByDate = () => {
-    if (!result) return;
-    const updated = sortPlacesByDate(result.places);
-    savePlaces(updated);
-  };
-
-  const hasAnyDates = result?.places.some((p) => Boolean(p.visitedAt));
+  // Compute displayed places according to the active orderMode
+  const displayedPlaces = useMemo(() => {
+    if (!result?.places) return [];
+    return getOrderedPlaces(result.places, orderMode);
+  }, [result?.places, orderMode]);
 
   return (
     <main className="review-page">
@@ -119,7 +133,7 @@ export function JourneyReview() {
               <h1>{result.listName}</h1>
               <p>
                 Check and arrange the places extracted from your Google Maps list
-                before building the map.
+                before visualizing the journey.
               </p>
             </div>
             <div className="review-stats">
@@ -141,21 +155,42 @@ export function JourneyReview() {
                 <strong>{result.places.length} imported places</strong>
               </div>
               <div className="review-head-actions">
-                {hasAnyDates && (
+                {/* Explicit Order Mode Switcher */}
+                <div className="order-mode-selector" role="group" aria-label="Journey ordering mode">
+                  <span className="order-mode-label">Order:</span>
                   <button
                     type="button"
-                    className="sort-date-btn"
-                    onClick={handleSortByDate}
-                    title="Sort places chronologically by assigned visit dates"
+                    className={`order-mode-btn ${orderMode === "manual" ? "active" : ""}`}
+                    onClick={() => handleOrderModeChange("manual")}
+                    aria-pressed={orderMode === "manual"}
                   >
-                    Sort by date
+                    Manual
                   </button>
-                )}
-                <Link href="/">← Import another list</Link>
+                  <button
+                    type="button"
+                    className={`order-mode-btn ${orderMode === "date" ? "active" : ""}`}
+                    onClick={() => handleOrderModeChange("date")}
+                    aria-pressed={orderMode === "date"}
+                  >
+                    Visit date
+                  </button>
+                </div>
+                <Link href="/" className="import-another-link">← Import another list</Link>
               </div>
             </div>
+
+            {orderMode === "date" && (
+              <div className="order-mode-banner" role="status">
+                <span className="banner-icon">ℹ</span>
+                <p>
+                  Visualization order is determined chronologically by your assigned
+                  visit dates. Places without dates appear at the end.
+                </p>
+              </div>
+            )}
+
             <div className="review-list">
-              {result.places.map((place, index) => (
+              {displayedPlaces.map((place, index) => (
                 <article key={place.id} className="review-row">
                   <span className="row-number">
                     {String(index + 1).padStart(2, "0")}
@@ -164,18 +199,20 @@ export function JourneyReview() {
                     <button
                       type="button"
                       onClick={() => handleMoveUp(index)}
-                      disabled={index === 0}
+                      disabled={orderMode === "date" || index === 0}
                       aria-label={`Move ${place.name} up in order`}
-                      title="Move up"
+                      title={orderMode === "date" ? "Ordering by date" : "Move up"}
                     >
                       ▲
                     </button>
                     <button
                       type="button"
                       onClick={() => handleMoveDown(index)}
-                      disabled={index === result.places.length - 1}
+                      disabled={
+                        orderMode === "date" || index === displayedPlaces.length - 1
+                      }
                       aria-label={`Move ${place.name} down in order`}
-                      title="Move down"
+                      title={orderMode === "date" ? "Ordering by date" : "Move down"}
                     >
                       ▼
                     </button>
@@ -219,7 +256,7 @@ export function JourneyReview() {
             </div>
             <footer className="review-footer">
               <p>
-                <strong>Next:</strong> Visualize your journey in interactive 3D travel animation.
+                <strong>Next:</strong> Visualize your journey in an interactive animated travel map.
               </p>
               <Link href="/map" className="continue-button">
                 Visualize journey <span>→</span>

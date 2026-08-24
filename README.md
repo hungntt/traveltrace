@@ -1,20 +1,28 @@
-# TravelTrace — Phase 1
+# TravelTrace
 
-Turn a public Google Maps saved-list URL into normalized, portable `TravelPlace[]` data.
+Turn a public Google Maps saved-list URL into an interactive animated travel journey.
 
-This repository intentionally implements only the first product phase:
+## Journey Flow
 
 ```text
-Google Maps shared-list URL → validated server import → normalized JSON
+Google Maps list URL → Server Import → Review & Arrange → Animated Map
 ```
 
-It does not yet include a map, country/continent resolution, journey editing, animation, accounts, or storage.
+1. **Import (`/`)**: Extracts places, addresses, coordinates, and metadata from a public Google Maps shared list without requiring a Google API key, login, or persistent database.
+2. **Review (`/journey`)**: Review imported locations, optionally assign visit dates, adjust sequence ordering manually (▲ / ▼) or sort chronologically, and preview extracted coordinates.
+3. **Map (`/map`)**: Interactive travel map rendering great-circle routes connecting destinations, smooth traveler animation, playback controls (Play, Pause, Replay, Prev, Next, Speed, Scrubber), and calm camera transitions.
+
+## Technology & Architecture
+
+- **Basemap & Rendering**: MapLibre GL rendering OpenFreeMap vector tiles (`https://tiles.openfreemap.org/styles/liberty`). No paid mapping APIs, tokens, or Mapbox keys required.
+- **Route Geometry**: Client-side great-circle geodesic calculation with antimeridian ($\pm 180^\circ$) support to prevent world-wrapping artifacts on transpacific routes.
+- **Privacy First**: Google Maps is used solely as an import source. All imported places, visit dates, and ordering modifications live exclusively in browser `sessionStorage` (`JOURNEY_SESSION_KEY`).
+- **Framework**: Next.js App Router with TypeScript and Tailwind CSS.
 
 ## Requirements
 
-- npm 9 or newer
-
-No system-wide Node upgrade or `nvm` installation is required. Development dependencies include a project-local Node 22 runtime, and the Next.js scripts select it automatically. Production environments can instead provide their own Node 20.9+ runtime and omit development dependencies.
+- Node.js 18.19+ (or local bundled Node runtime)
+- npm 9+
 
 ## Run locally
 
@@ -23,9 +31,7 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000), make a Google Maps list public to “Anyone with the link,” and paste its shared URL.
-
-When bootstrapping with an older system Node version, `npm install` may print an `EBADENGINE` warning for Next.js while it is installing the local runtime. That warning is non-fatal; subsequent `npm run dev` and `npm run build` commands execute Next.js with the bundled Node 22 binary.
+Open [http://localhost:3000](http://localhost:3000), paste a public Google Maps saved list URL (e.g. `https://maps.app.goo.gl/...`), and start exploring.
 
 ## API
 
@@ -37,58 +43,7 @@ When bootstrapping with an older system Node version, `npm install` may print an
 }
 ```
 
-Successful responses contain list metadata, normalized coordinate-ready places, and non-fatal issues:
-
-```json
-{
-  "data": {
-    "source": "google-maps",
-    "listName": "My places",
-    "totalFound": 2,
-    "places": [
-      {
-        "id": "google:ChIJ...",
-        "name": "Hanoi",
-        "address": "Hanoi, Vietnam",
-        "latitude": 21.0285,
-        "longitude": 105.8542,
-        "googlePlaceId": "ChIJ...",
-        "googleMapsUrl": "https://www.google.com/maps/place/?q=place_id:ChIJ...",
-        "originalIndex": 0,
-        "journeyIndex": 0
-      }
-    ],
-    "issues": []
-  }
-}
-```
-
-Places without usable coordinates are reported in `issues` rather than causing the entire import to fail.
-
-## Import boundaries
-
-The Google-specific logic is isolated in [`src/lib/importers/google-maps`](src/lib/importers/google-maps). It follows the extraction sequence documented by the open-source [`gmaps-list`](https://github.com/anupamchugh/gmaps-list) project:
-
-1. Resolve the public shared-list link.
-2. Find the allowlisted `entitylist/getlist` preload endpoint in the canonical page.
-3. Fetch the response and remove its XSSI prefix.
-4. Parse Google’s nested response.
-5. Normalize the result into the app-owned schema.
-
-Because this is an undocumented Google endpoint, failures caused by a response-format change are surfaced separately from private or invalid lists.
-
-## Security and privacy
-
-- HTTPS-only allowlist for `maps.app.goo.gl`, `google.com`, and `www.google.com`.
-- Every redirect is validated; redirects to other hosts are rejected.
-- The extracted RPC URL is independently validated.
-- Five-redirect limit and ten-second total timeout.
-- Two-megabyte HTML and eight-megabyte list-response limits.
-- Strict request schema and four-kilobyte request-body limit.
-- In-memory per-client rate limiting and short-lived bounded result caching.
-- No database, accounts, cookies, tracking, or persisted travel history.
-
-In-memory protection is suitable for the stateless MVP. A shared rate-limit/cache service should replace it before horizontally scaled deployment.
+Returns list metadata, normalized coordinate-ready places, and any non-fatal coordinate issues.
 
 ## Verification
 
@@ -96,7 +51,4 @@ In-memory protection is suitable for the stateless MVP. A shared rate-limit/cach
 npm test
 npm run lint
 npm run build
-npm audit
 ```
-
-The test suite covers URL/redirect validation, parsing, normalization, response limits, end-to-end importer behavior, and the route-handler contract.

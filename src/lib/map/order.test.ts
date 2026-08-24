@@ -33,6 +33,14 @@ const mockPlaces: TravelPlace[] = [
     originalIndex: 2,
     journeyIndex: 2,
   },
+  {
+    id: "p4",
+    name: "Sydney Opera House",
+    latitude: -33.8568,
+    longitude: 151.2153,
+    originalIndex: 3,
+    journeyIndex: 3,
+  },
 ];
 
 describe("order utilities", () => {
@@ -51,13 +59,13 @@ describe("order utilities", () => {
   it("movePlace should move an item up and down correctly and update journeyIndex", () => {
     // Move p3 (index 2) up to index 0
     const movedUp = movePlace(mockPlaces, 2, 0);
-    expect(movedUp.map((p) => p.id)).toEqual(["p3", "p1", "p2"]);
-    expect(movedUp.map((p) => p.journeyIndex)).toEqual([0, 1, 2]);
+    expect(movedUp.map((p) => p.id)).toEqual(["p3", "p1", "p2", "p4"]);
+    expect(movedUp.map((p) => p.journeyIndex)).toEqual([0, 1, 2, 3]);
 
     // Move p1 (index 0) down to index 2
     const movedDown = movePlace(mockPlaces, 0, 2);
-    expect(movedDown.map((p) => p.id)).toEqual(["p2", "p3", "p1"]);
-    expect(movedDown.map((p) => p.journeyIndex)).toEqual([0, 1, 2]);
+    expect(movedDown.map((p) => p.id)).toEqual(["p2", "p3", "p1", "p4"]);
+    expect(movedDown.map((p) => p.journeyIndex)).toEqual([0, 1, 2, 3]);
 
     // Out of bounds should do nothing
     expect(movePlace(mockPlaces, -1, 1)).toEqual(mockPlaces);
@@ -69,31 +77,63 @@ describe("order utilities", () => {
     expect(updated[1].visitedAt).toBe("2024-04-10");
     expect(updated[0].visitedAt).toBeUndefined();
 
-    // Clear date with empty string
-    const cleared = updatePlaceDate(updated, "p2", "");
+    // Clear date with empty or whitespace string
+    const cleared = updatePlaceDate(updated, "p2", "   ");
     expect(cleared[1].visitedAt).toBeUndefined();
   });
 
-  it("sortPlacesByDate should order chronologically with fallback to journeyIndex", () => {
-    const withDates: TravelPlace[] = [
-      { ...mockPlaces[0], visitedAt: "2024-05-20", journeyIndex: 0 },
-      { ...mockPlaces[1], visitedAt: "2024-01-15", journeyIndex: 1 },
-      { ...mockPlaces[2], visitedAt: undefined, journeyIndex: 2 },
-    ];
+  describe("sortPlacesByDate & getOrderedPlaces", () => {
+    it("should order chronologically by date", () => {
+      const withDates: TravelPlace[] = [
+        { ...mockPlaces[0], visitedAt: "2024-05-20", journeyIndex: 0 },
+        { ...mockPlaces[1], visitedAt: "2024-01-15", journeyIndex: 1 },
+        { ...mockPlaces[2], visitedAt: "2023-11-01", journeyIndex: 2 },
+      ];
 
-    const sorted = sortPlacesByDate(withDates);
-    // 2024-01-15 (Eiffel Tower) comes first, then 2024-05-20 (Tokyo Tower), then no date (Empire State)
-    expect(sorted.map((p) => p.id)).toEqual(["p2", "p1", "p3"]);
-    expect(sorted.map((p) => p.journeyIndex)).toEqual([0, 1, 2]);
-  });
+      const sorted = sortPlacesByDate(withDates);
+      expect(sorted.map((p) => p.id)).toEqual(["p3", "p2", "p1"]); // 2023-11-01 (p3), 2024-01-15 (p2), 2024-05-20 (p1)
+      expect(sorted.map((p) => p.journeyIndex)).toEqual([0, 1, 2]);
+    });
 
-  it("getOrderedPlaces should return places sorted by journeyIndex", () => {
-    const unarranged = [
-      { ...mockPlaces[2], journeyIndex: 2 },
-      { ...mockPlaces[0], journeyIndex: 0 },
-      { ...mockPlaces[1], journeyIndex: 1 },
-    ];
-    const ordered = getOrderedPlaces(unarranged);
-    expect(ordered.map((p) => p.id)).toEqual(["p1", "p2", "p3"]);
+    it("should use journeyIndex as stable tiebreaker for equal dates", () => {
+      const equalDates: TravelPlace[] = [
+        { ...mockPlaces[0], visitedAt: "2024-05-20", journeyIndex: 0 },
+        { ...mockPlaces[1], visitedAt: "2024-05-20", journeyIndex: 1 },
+        { ...mockPlaces[2], visitedAt: "2024-01-10", journeyIndex: 2 },
+      ];
+
+      const sorted = sortPlacesByDate(equalDates);
+      // p3 first (Jan 10), then p1 before p2 because p1.journeyIndex (0) < p2.journeyIndex (1)
+      expect(sorted.map((p) => p.id)).toEqual(["p3", "p1", "p2"]);
+      expect(sorted.map((p) => p.journeyIndex)).toEqual([0, 1, 2]);
+    });
+
+    it("should place undated locations after dated locations in stable manual order", () => {
+      const mixed: TravelPlace[] = [
+        { ...mockPlaces[0], visitedAt: undefined, journeyIndex: 0 }, // undated (idx 0)
+        { ...mockPlaces[1], visitedAt: "2024-06-01", journeyIndex: 1 }, // dated
+        { ...mockPlaces[2], visitedAt: undefined, journeyIndex: 2 }, // undated (idx 2)
+        { ...mockPlaces[3], visitedAt: "2024-02-01", journeyIndex: 3 }, // dated
+      ];
+
+      const sorted = sortPlacesByDate(mixed);
+      // Dated: p4 (Feb 01), p2 (June 01).
+      // Undated: p1 (idx 0), p3 (idx 2).
+      expect(sorted.map((p) => p.id)).toEqual(["p4", "p2", "p1", "p3"]);
+      expect(sorted.map((p) => p.journeyIndex)).toEqual([0, 1, 2, 3]);
+    });
+
+    it("getOrderedPlaces respects manual vs date mode", () => {
+      const places: TravelPlace[] = [
+        { ...mockPlaces[0], visitedAt: "2024-12-01", journeyIndex: 0 },
+        { ...mockPlaces[1], visitedAt: "2024-01-01", journeyIndex: 1 },
+      ];
+
+      const manual = getOrderedPlaces(places, "manual");
+      expect(manual.map((p) => p.id)).toEqual(["p1", "p2"]);
+
+      const dateOrdered = getOrderedPlaces(places, "date");
+      expect(dateOrdered.map((p) => p.id)).toEqual(["p2", "p1"]);
+    });
   });
 });

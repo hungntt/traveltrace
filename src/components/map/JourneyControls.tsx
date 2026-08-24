@@ -7,7 +7,10 @@ export interface JourneyControlsProps {
   isPlaying: boolean;
   progress: number; // 0 to Math.max(0, places.length - 1)
   speed: number; // 0.5 | 1 | 2
-  currentStopIndex: number;
+  isTransit: boolean;
+  departedStopIndex: number;
+  destinationStopIndex: number;
+  arrivedStopIndex: number | null;
   onPlay: () => void;
   onPause: () => void;
   onReplay: () => void;
@@ -23,7 +26,10 @@ export function JourneyControls({
   isPlaying,
   progress,
   speed,
-  currentStopIndex,
+  isTransit,
+  departedStopIndex,
+  destinationStopIndex,
+  arrivedStopIndex,
   onPlay,
   onPause,
   onReplay,
@@ -34,12 +40,17 @@ export function JourneyControls({
   onFitJourney,
 }: JourneyControlsProps) {
   const totalStops = places.length;
-  const currentPlace = places[currentStopIndex] ?? places[0];
-  const maxProgress = Math.max(1, totalStops - 1);
+  const isSingleStop = totalStops <= 1;
+  const maxProgress = Math.max(0, totalStops - 1);
 
-  // Format date if present (e.g. YYYY-MM-DD to localized date or clean string)
-  const formattedDate = currentPlace?.visitedAt
-    ? new Date(currentPlace.visitedAt).toLocaleDateString(undefined, {
+  // Active display place: target destination during transit, or arrived stop
+  const displayIndex = isTransit
+    ? destinationStopIndex
+    : arrivedStopIndex ?? Math.min(totalStops - 1, Math.floor(progress));
+  const activePlace = places[displayIndex] ?? places[0];
+
+  const formattedDate = activePlace?.visitedAt
+    ? new Date(activePlace.visitedAt).toLocaleDateString(undefined, {
         year: "numeric",
         month: "short",
         day: "numeric",
@@ -50,18 +61,22 @@ export function JourneyControls({
   return (
     <div className="journey-controls-panel">
       {/* Current Stop Header Card */}
-      {currentPlace && (
+      {activePlace && (
         <div className="current-stop-card">
           <div className="stop-badge">
-            <span className="stop-index">
-              Stop {currentStopIndex + 1} of {totalStops}
+            <span className={`stop-index ${isTransit ? "in-transit" : ""}`}>
+              {isSingleStop
+                ? "Stop 1 of 1"
+                : isTransit
+                ? `Traveling to Stop ${destinationStopIndex + 1} of ${totalStops}`
+                : `Stop ${(arrivedStopIndex ?? displayIndex) + 1} of ${totalStops}`}
             </span>
             {formattedDate && <span className="stop-date">{formattedDate}</span>}
           </div>
           <div className="stop-details">
-            <h3 className="stop-name">{currentPlace.name}</h3>
-            {currentPlace.address && (
-              <p className="stop-address">{currentPlace.address}</p>
+            <h3 className="stop-name">{activePlace.name}</h3>
+            {activePlace.address && (
+              <p className="stop-address">{activePlace.address}</p>
             )}
           </div>
         </div>
@@ -77,31 +92,47 @@ export function JourneyControls({
           <input
             type="range"
             min={0}
-            max={maxProgress}
+            max={Math.max(1, maxProgress)}
             step={0.005}
-            value={progress}
+            value={isSingleStop ? 0 : progress}
             onChange={(e) => onSeek(parseFloat(e.target.value))}
+            disabled={isSingleStop}
             aria-label="Journey timeline scrubber"
             className="timeline-slider"
             style={
               {
-                "--progress-pct": `${(progress / maxProgress) * 100}%`,
+                "--progress-pct": isSingleStop
+                  ? "100%"
+                  : `${(progress / maxProgress) * 100}%`,
               } as React.CSSProperties
             }
           />
           <div className="timeline-stop-dots" aria-hidden="true">
-            {places.map((place, idx) => (
-              <span
-                key={place.id}
-                className={`timeline-dot ${
-                  progress >= idx ? "reached" : ""
-                } ${Math.round(progress) === idx ? "active" : ""}`}
-                style={{
-                  left: `${(idx / maxProgress) * 100}%`,
-                }}
-                title={`${idx + 1}. ${place.name}`}
-              />
-            ))}
+            {places.map((place, idx) => {
+              const isReached = isTransit
+                ? idx <= departedStopIndex
+                : idx <= (arrivedStopIndex ?? displayIndex);
+              const isActive = isTransit
+                ? idx === destinationStopIndex
+                : idx === (arrivedStopIndex ?? displayIndex);
+              const isTarget = isTransit && idx === destinationStopIndex;
+
+              return (
+                <span
+                  key={place.id}
+                  className={`timeline-dot ${isReached ? "reached" : ""} ${
+                    isActive ? "active" : ""
+                  } ${isTarget ? "target-dot" : ""}`}
+                  style={{
+                    left:
+                      maxProgress === 0
+                        ? "50%"
+                        : `${(idx / maxProgress) * 100}%`,
+                  }}
+                  title={`${idx + 1}. ${place.name}`}
+                />
+              );
+            })}
           </div>
         </div>
       </div>
@@ -129,7 +160,7 @@ export function JourneyControls({
             type="button"
             className="ctrl-btn"
             onClick={onPrev}
-            disabled={progress <= 0}
+            disabled={isSingleStop || progress <= 0}
             title="Previous destination"
             aria-label="Jump to previous destination"
           >
@@ -144,6 +175,7 @@ export function JourneyControls({
             type="button"
             className={`ctrl-btn play-pause-btn ${isPlaying ? "playing" : ""}`}
             onClick={isPlaying ? onPause : onPlay}
+            disabled={isSingleStop}
             title={isPlaying ? "Pause" : "Play"}
             aria-label={isPlaying ? "Pause animation" : "Play journey animation"}
           >
@@ -165,7 +197,7 @@ export function JourneyControls({
             type="button"
             className="ctrl-btn"
             onClick={onNext}
-            disabled={progress >= maxProgress}
+            disabled={isSingleStop || progress >= maxProgress}
             title="Next destination"
             aria-label="Jump to next destination"
           >

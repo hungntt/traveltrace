@@ -13,8 +13,18 @@ export function normalizeJourneyIndices(places: TravelPlace[]): TravelPlace[] {
 /**
  * Moves a place from one index to another, re-indexing journeyIndex
  */
-export function movePlace(places: TravelPlace[], fromIndex: number, toIndex: number): TravelPlace[] {
-  if (fromIndex < 0 || fromIndex >= places.length || toIndex < 0 || toIndex >= places.length || fromIndex === toIndex) {
+export function movePlace(
+  places: TravelPlace[],
+  fromIndex: number,
+  toIndex: number
+): TravelPlace[] {
+  if (
+    fromIndex < 0 ||
+    fromIndex >= places.length ||
+    toIndex < 0 ||
+    toIndex >= places.length ||
+    fromIndex === toIndex
+  ) {
     return places;
   }
   const result = [...places];
@@ -35,7 +45,7 @@ export function updatePlaceDate(
     if (place.id === placeId) {
       return {
         ...place,
-        visitedAt: visitedAt ? visitedAt.trim() : undefined,
+        visitedAt: visitedAt && visitedAt.trim() ? visitedAt.trim() : undefined,
       };
     }
     return place;
@@ -43,7 +53,9 @@ export function updatePlaceDate(
 }
 
 /**
- * Sorts places chronologically by visitedAt if available, preserving relative journeyIndex for items without dates
+ * Sorts places chronologically by visitedAt.
+ * Equal dates use journeyIndex as the stable tiebreaker.
+ * Places without dates appear after dated places in stable manual order.
  */
 export function sortPlacesByDate(places: TravelPlace[]): TravelPlace[] {
   const sorted = [...places].sort((a, b) => {
@@ -68,8 +80,14 @@ export function sortPlacesByDate(places: TravelPlace[]): TravelPlace[] {
 }
 
 /**
- * Gets places sorted strictly by journeyIndex (fallback/default ordering)
+ * Gets places sorted based on the selected ordering mode ("manual" | "date")
  */
-export function getOrderedPlaces(places: TravelPlace[]): TravelPlace[] {
+export function getOrderedPlaces(
+  places: TravelPlace[],
+  orderMode: "manual" | "date" = "manual"
+): TravelPlace[] {
+  if (orderMode === "date") {
+    return sortPlacesByDate(places);
+  }
   return [...places].sort((a, b) => a.journeyIndex - b.journeyIndex);
 }

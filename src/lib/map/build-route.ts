@@ -1,12 +1,15 @@
 import * as turf from "@turf/turf";
-import type { Feature, FeatureCollection, Geometry, LineString, MultiLineString } from "geojson";
+import type { Feature, FeatureCollection, LineString, MultiLineString } from "geojson";
 import type { TravelPlace } from "@/types/import";
 
 export interface TravelerState {
   position: [number, number]; // [lng, lat]
   bearing: number;
-  currentStopIndex: number;
+  departedStopIndex: number;
+  destinationStopIndex: number;
+  arrivedStopIndex: number | null; // non-null when currently at a stop
   isAtStop: boolean;
+  isTransit: boolean;
   progress: number;
 }
 
@@ -69,6 +72,10 @@ export function calculateBearing(p1: [number, number], p2: [number, number]): nu
   const x =
     Math.cos(lat1) * Math.sin(lat2) -
     Math.sin(lat1) * Math.cos(lat2) * Math.cos(lon2 - lon1);
+
+  if (Math.abs(y) < 1e-9 && Math.abs(x) < 1e-9) {
+    return 0;
+  }
 
   const brng = Math.atan2(y, x);
   return (toDeg(brng) + 360) % 360;
@@ -152,6 +159,27 @@ export function buildProgressRouteGeoJSON(
 
   const maxProgress = places.length - 1;
   const clampedProgress = Math.max(0, Math.min(maxProgress, progress));
+
+  // If we have reached or exceeded the final progress, every segment is completed
+  if (clampedProgress >= maxProgress) {
+    const allCompletedFeatures: Feature<LineString | MultiLineString>[] = [];
+    for (let i = 0; i < places.length - 1; i++) {
+      const p1: [number, number] = [places[i].longitude, places[i].latitude];
+      const p2: [number, number] = [places[i + 1].longitude, places[i + 1].latitude];
+      allCompletedFeatures.push(buildGreatCircleSegment(p1, p2, i));
+    }
+    return {
+      completedGeoJson: {
+        type: "FeatureCollection",
+        features: allCompletedFeatures,
+      },
+      activeGeoJson: {
+        type: "FeatureCollection",
+        features: [],
+      },
+    };
+  }
+
   const currentSegmentIndex = Math.min(Math.floor(clampedProgress), places.length - 2);
   const segmentFraction = clampedProgress - currentSegmentIndex;
 
@@ -202,14 +230,54 @@ export function getTravelerState(places: TravelPlace[], progress: number): Trave
     return {
       position: [places[0].longitude, places[0].latitude],
       bearing: 0,
-      currentStopIndex: 0,
+      departedStopIndex: 0,
+      destinationStopIndex: 0,
+      arrivedStopIndex: 0,
       isAtStop: true,
+      isTransit: false,
       progress: 0,
     };
   }
 
   const maxProgress = places.length - 1;
   const clampedProgress = Math.max(0, Math.min(maxProgress, progress));
+
+  if (clampedProgress <= 0) {
+    const p1: [number, number] = [places[0].longitude, places[0].latitude];
+    const p2: [number, number] = [places[1].longitude, places[1].latitude];
+    return {
+      position: p1,
+      bearing: calculateBearing(p1, p2),
+      departedStopIndex: 0,
+      destinationStopIndex: 1,
+      arrivedStopIndex: 0,
+      isAtStop: true,
+      isTransit: false,
+      progress: 0,
+    };
+  }
+
+  if (clampedProgress >= maxProgress) {
+    const pLastPrev: [number, number] = [
+      places[places.length - 2].longitude,
+      places[places.length - 2].latitude,
+    ];
+    const pLast: [number, number] = [
+      places[places.length - 1].longitude,
+      places[places.length - 1].latitude,
+    ];
+    return {
+      position: pLast,
+      bearing: calculateBearing(pLastPrev, pLast),
+      departedStopIndex: places.length - 2,
+      destinationStopIndex: places.length - 1,
+      arrivedStopIndex: places.length - 1,
+      isAtStop: true,
+      isTransit: false,
+      progress: maxProgress,
+    };
+  }
+
   const currentSegmentIndex = Math.min(Math.floor(clampedProgress), places.length - 2);
   const segmentFraction = clampedProgress - currentSegmentIndex;
 
@@ -224,25 +292,49 @@ export function getTravelerState(places: TravelPlace[], progress: number): Trave
 
   const position = intermediatePoint(p1, p2, segmentFraction);
 
-  // Look ahead slightly for bearing
+  // Look ahead slightly along geodesic arc for bearing
   const lookAheadFraction = Math.min(1, segmentFraction + 0.05);
   const lookAheadPoint = intermediatePoint(p1, p2, lookAheadFraction);
   const bearing = calculateBearing(position, lookAheadPoint);
 
-  const isAtStop = segmentFraction < 0.01 || segmentFraction > 0.99;
-  const currentStopIndex = Math.round(clampedProgress);
+  const isAtStop = segmentFraction < 0.001;
+  const isTransit = !isAtStop;
 
   return {
     position,
     bearing,
-    currentStopIndex,
+    departedStopIndex: currentSegmentIndex,
+    destinationStopIndex: currentSegmentIndex + 1,
+    arrivedStopIndex: isAtStop ? currentSegmentIndex : null,
     isAtStop,
+    isTransit,
     progress: clampedProgress,
   };
 }
 
 /**
- * Computes bounding box [[minLng, minLat], [maxLng, maxLat]] for all places.
+ * Calculates sum of great-circle distances between consecutive destinations in kilometers.
+ */
+export function calculateTotalRouteDistance(places: TravelPlace[]): number {
+  if (places.length < 2) return 0;
+  let totalKm = 0;
+  for (let i = 0; i < places.length - 1; i++) {
+    const pt1 = turf.point([places[i].longitude, places[i].latitude]);
+    const pt2 = turf.point([places[i + 1].longitude, places[i + 1].latitude]);
+    totalKm += turf.distance(pt1, pt2, { units: "kilometers" });
+  }
+  return totalKm;
+}
+
+/**
+ * Formats kilometers into a clean string (e.g. "24,830 km" or "850 km").
+ */
+export function formatDistance(km: number): string {
+  return `${Math.round(km).toLocaleString()} km`;
+}
+
+/**
+ * Computes antimeridian-aware bounding box [[minLng, minLat], [maxLng, maxLat]] for all places.
  */
 export function getJourneyBounds(
   places: TravelPlace[]
@@ -262,30 +354,54 @@ export function getJourneyBounds(
     ];
   }
 
-  let minLng = places[0].longitude;
-  let maxLng = places[0].longitude;
   let minLat = places[0].latitude;
   let maxLat = places[0].latitude;
 
   for (const place of places) {
-    minLng = Math.min(minLng, place.longitude);
-    maxLng = Math.max(maxLng, place.longitude);
     minLat = Math.min(minLat, place.latitude);
     maxLat = Math.max(maxLat, place.latitude);
   }
 
-  // Add small padding if all points have same coordinate
-  if (minLng === maxLng) {
-    minLng -= 0.05;
-    maxLng += 0.05;
-  }
   if (minLat === maxLat) {
     minLat -= 0.05;
     maxLat += 0.05;
   }
 
+  // Antimeridian-aware longitudinal span optimization on [0, 360)
+  const normLngs = places.map((p) => ((p.longitude % 360) + 360) % 360);
+  const sorted = Array.from(new Set(normLngs)).sort((a, b) => a - b);
+
+  if (sorted.length === 1) {
+    const lng = places[0].longitude;
+    return [
+      [lng - 0.05, minLat],
+      [lng + 0.05, maxLat],
+    ];
+  }
+
+  let maxGap = sorted[0] + 360 - sorted[sorted.length - 1];
+  let bestStart = sorted[0];
+  let bestEnd = sorted[sorted.length - 1];
+
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const gap = sorted[i + 1] - sorted[i];
+    if (gap > maxGap) {
+      maxGap = gap;
+      bestStart = sorted[i + 1];
+      bestEnd = sorted[i] + 360;
+    }
+  }
+
+  let startLng = bestStart > 180 ? bestStart - 360 : bestStart;
+  let endLng = startLng + (bestEnd - bestStart);
+
+  if (startLng === endLng) {
+    startLng -= 0.05;
+    endLng += 0.05;
+  }
+
   return [
-    [minLng, minLat],
-    [maxLng, maxLat],
+    [startLng, minLat],
+    [endLng, maxLat],
   ];
 }
