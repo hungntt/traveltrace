@@ -11,6 +11,7 @@ export interface JourneyControlsProps {
   departedStopIndex: number;
   destinationStopIndex: number;
   arrivedStopIndex: number | null;
+  animationReady?: boolean;
   onPlay: () => void;
   onPause: () => void;
   onReplay: () => void;
@@ -30,6 +31,7 @@ export function JourneyControls({
   departedStopIndex,
   destinationStopIndex,
   arrivedStopIndex,
+  animationReady = true,
   onPlay,
   onPause,
   onReplay,
@@ -42,6 +44,7 @@ export function JourneyControls({
   const totalStops = places.length;
   const isSingleStop = totalStops <= 1;
   const maxProgress = Math.max(0, totalStops - 1);
+  const isControlDisabled = isSingleStop || !animationReady;
 
   // Active display place: target destination during transit, or arrived stop
   const displayIndex = isTransit
@@ -96,7 +99,7 @@ export function JourneyControls({
             step={0.005}
             value={isSingleStop ? 0 : progress}
             onChange={(e) => onSeek(parseFloat(e.target.value))}
-            disabled={isSingleStop}
+            disabled={isControlDisabled}
             aria-label="Journey timeline scrubber"
             className="timeline-slider"
             style={
@@ -145,6 +148,7 @@ export function JourneyControls({
             type="button"
             className="ctrl-btn"
             onClick={onReplay}
+            disabled={!animationReady}
             title="Replay from beginning"
             aria-label="Replay journey from beginning"
           >
@@ -160,7 +164,7 @@ export function JourneyControls({
             type="button"
             className="ctrl-btn"
             onClick={onPrev}
-            disabled={isSingleStop || progress <= 0}
+            disabled={isControlDisabled || progress <= 0}
             title="Previous destination"
             aria-label="Jump to previous destination"
           >
@@ -175,7 +179,7 @@ export function JourneyControls({
             type="button"
             className={`ctrl-btn play-pause-btn ${isPlaying ? "playing" : ""}`}
             onClick={isPlaying ? onPause : onPlay}
-            disabled={isSingleStop}
+            disabled={isControlDisabled}
             title={isPlaying ? "Pause" : "Play"}
             aria-label={isPlaying ? "Pause animation" : "Play journey animation"}
           >
@@ -197,7 +201,7 @@ export function JourneyControls({
             type="button"
             className="ctrl-btn"
             onClick={onNext}
-            disabled={isSingleStop || progress >= maxProgress}
+            disabled={isControlDisabled || progress >= maxProgress}
             title="Next destination"
             aria-label="Jump to next destination"
           >
@@ -231,6 +235,7 @@ export function JourneyControls({
             type="button"
             className="ctrl-btn fit-btn"
             onClick={onFitJourney}
+            disabled={!animationReady}
             title="Fit whole journey in view"
             aria-label="Fit whole journey in map view"
           >

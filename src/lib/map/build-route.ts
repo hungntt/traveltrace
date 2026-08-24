@@ -13,6 +13,27 @@ export interface TravelerState {
   progress: number;
 }
 
+export interface PreparedSegment {
+  segmentIndex: number;
+  p1: [number, number];
+  p2: [number, number];
+  distanceKm: number;
+  samples: [number, number][];
+  unwrappedSamples: [number, number][];
+  fullFeature: Feature<LineString | MultiLineString>;
+}
+
+/**
+ * Unwraps a longitude value relative to a reference longitude to ensure continuous motion
+ * across the ±180° antimeridian.
+ */
+export function unwrapLongitude(lng: number, referenceLng: number): number {
+  let uLng = lng;
+  while (uLng - referenceLng > 180) uLng -= 360;
+  while (uLng - referenceLng < -180) uLng += 360;
+  return uLng;
+}
+
 /**
  * Calculates geodesic intermediate point between two [lng, lat] coordinates
  * at fraction f (0 to 1) using spherical slerp.
@@ -100,7 +121,7 @@ export function buildGreatCircleSegment(
     });
   }
 
-  const npoints = Math.max(16, Math.min(100, Math.round(distKm / 60)));
+  const npoints = Math.max(24, Math.min(100, Math.round(distKm / 50)));
   const gc = turf.greatCircle(pt1, pt2, {
     npoints,
     properties: {
@@ -110,6 +131,55 @@ export function buildGreatCircleSegment(
   });
 
   return gc as Feature<LineString | MultiLineString>;
+}
+
+/**
+ * Precomputes route geometry and dense sampled points for each segment.
+ * Call this once when places change, avoiding expensive Turf calls during playback animation frames.
+ */
+export function prepareSegments(places: TravelPlace[]): PreparedSegment[] {
+  if (places.length < 2) return [];
+
+  const segments: PreparedSegment[] = [];
+  const SAMPLES_PER_SEGMENT = 64;
+
+  for (let i = 0; i < places.length - 1; i++) {
+    const p1: [number, number] = [places[i].longitude, places[i].latitude];
+    const p2: [number, number] = [places[i + 1].longitude, places[i + 1].latitude];
+
+    const pt1 = turf.point(p1);
+    const pt2 = turf.point(p2);
+    const distanceKm = turf.distance(pt1, pt2, { units: "kilometers" });
+
+    const samples: [number, number][] = [];
+    const unwrappedSamples: [number, number][] = [];
+
+    let prevLng = p1[0];
+
+    for (let s = 0; s <= SAMPLES_PER_SEGMENT; s++) {
+      const fraction = s / SAMPLES_PER_SEGMENT;
+      const pt = intermediatePoint(p1, p2, fraction);
+      samples.push(pt);
+
+      const uLng = unwrapLongitude(pt[0], prevLng);
+      unwrappedSamples.push([uLng, pt[1]]);
+      prevLng = uLng;
+    }
+
+    const fullFeature = buildGreatCircleSegment(p1, p2, i);
+
+    segments.push({
+      segmentIndex: i,
+      p1,
+      p2,
+      distanceKm,
+      samples,
+      unwrappedSamples,
+      fullFeature,
+    });
+  }
+
+  return segments;
 }
 
 /**
@@ -221,9 +291,81 @@ export function buildProgressRouteGeoJSON(
 }
 
 /**
+ * Optimized runtime progress route generator that reuses precomputed segments.
+ */
+export function buildOptimizedProgressRoute(
+  preparedSegments: PreparedSegment[],
+  progress: number
+): {
+  completedGeoJson: FeatureCollection<LineString | MultiLineString>;
+  activeGeoJson: FeatureCollection<LineString | MultiLineString>;
+} {
+  if (preparedSegments.length === 0 || progress <= 0) {
+    return {
+      completedGeoJson: { type: "FeatureCollection", features: [] },
+      activeGeoJson: { type: "FeatureCollection", features: [] },
+    };
+  }
+
+  const maxProgress = preparedSegments.length;
+  const clampedProgress = Math.max(0, Math.min(maxProgress, progress));
+
+  if (clampedProgress >= maxProgress) {
+    return {
+      completedGeoJson: {
+        type: "FeatureCollection",
+        features: preparedSegments.map((s) => s.fullFeature),
+      },
+      activeGeoJson: {
+        type: "FeatureCollection",
+        features: [],
+      },
+    };
+  }
+
+  const currentSegmentIndex = Math.min(
+    Math.floor(clampedProgress),
+    preparedSegments.length - 1
+  );
+  const segmentFraction = clampedProgress - currentSegmentIndex;
+
+  const completedFeatures: Feature<LineString | MultiLineString>[] = [];
+  for (let i = 0; i < currentSegmentIndex; i++) {
+    completedFeatures.push(preparedSegments[i].fullFeature);
+  }
+
+  const activeFeatures: Feature<LineString | MultiLineString>[] = [];
+  if (segmentFraction > 0.001) {
+    const curSeg = preparedSegments[currentSegmentIndex];
+    const currentPoint = intermediatePoint(curSeg.p1, curSeg.p2, segmentFraction);
+    const activeSegment = buildGreatCircleSegment(
+      curSeg.p1,
+      currentPoint,
+      currentSegmentIndex
+    );
+    activeFeatures.push(activeSegment);
+  }
+
+  return {
+    completedGeoJson: {
+      type: "FeatureCollection",
+      features: completedFeatures,
+    },
+    activeGeoJson: {
+      type: "FeatureCollection",
+      features: activeFeatures,
+    },
+  };
+}
+
+/**
  * Calculates current traveler position, bearing, and stop status given progress (0 to N-1).
  */
-export function getTravelerState(places: TravelPlace[], progress: number): TravelerState | null {
+export function getTravelerState(
+  places: TravelPlace[],
+  progress: number,
+  preparedSegments?: PreparedSegment[]
+): TravelerState | null {
   if (places.length === 0) return null;
 
   if (places.length === 1) {
@@ -281,21 +423,33 @@ export function getTravelerState(places: TravelPlace[], progress: number): Trave
   const currentSegmentIndex = Math.min(Math.floor(clampedProgress), places.length - 2);
   const segmentFraction = clampedProgress - currentSegmentIndex;
 
-  const p1: [number, number] = [
-    places[currentSegmentIndex].longitude,
-    places[currentSegmentIndex].latitude,
-  ];
-  const p2: [number, number] = [
-    places[currentSegmentIndex + 1].longitude,
-    places[currentSegmentIndex + 1].latitude,
-  ];
+  const p1 =
+    preparedSegments && preparedSegments[currentSegmentIndex]
+      ? preparedSegments[currentSegmentIndex].p1
+      : ([places[currentSegmentIndex].longitude, places[currentSegmentIndex].latitude] as [
+          number,
+          number
+        ]);
+  const p2 =
+    preparedSegments && preparedSegments[currentSegmentIndex]
+      ? preparedSegments[currentSegmentIndex].p2
+      : ([places[currentSegmentIndex + 1].longitude, places[currentSegmentIndex + 1].latitude] as [
+          number,
+          number
+        ]);
 
-  const position = intermediatePoint(p1, p2, segmentFraction);
+  const rawPosition = intermediatePoint(p1, p2, segmentFraction);
+
+  // For continuous motion across date line, unwrap relative to start of segment
+  const position: [number, number] = [
+    unwrapLongitude(rawPosition[0], p1[0]),
+    rawPosition[1],
+  ];
 
   // Look ahead slightly along geodesic arc for bearing
-  const lookAheadFraction = Math.min(1, segmentFraction + 0.05);
+  const lookAheadFraction = Math.min(1, segmentFraction + 0.04);
   const lookAheadPoint = intermediatePoint(p1, p2, lookAheadFraction);
-  const bearing = calculateBearing(position, lookAheadPoint);
+  const bearing = calculateBearing(rawPosition, lookAheadPoint);
 
   const isAtStop = segmentFraction < 0.001;
   const isTransit = !isAtStop;

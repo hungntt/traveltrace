@@ -3,6 +3,7 @@ import type { TravelPlace } from "@/types/import";
 import {
   buildFullRouteFeatureCollection,
   buildGreatCircleSegment,
+  buildOptimizedProgressRoute,
   buildProgressRouteGeoJSON,
   calculateBearing,
   calculateTotalRouteDistance,
@@ -10,6 +11,8 @@ import {
   getJourneyBounds,
   getTravelerState,
   intermediatePoint,
+  prepareSegments,
+  unwrapLongitude,
 } from "./build-route";
 
 const samplePlaces: TravelPlace[] = [
@@ -40,6 +43,23 @@ const samplePlaces: TravelPlace[] = [
 ];
 
 describe("build-route utilities", () => {
+  describe("unwrapLongitude", () => {
+    it("should keep longitude unchanged when within [-180, 180] span of reference", () => {
+      expect(unwrapLongitude(10, 0)).toBe(10);
+      expect(unwrapLongitude(-10, 0)).toBe(-10);
+    });
+
+    it("should unwrap across the antimeridian going East", () => {
+      // Reference at 179 deg, next point at -179 deg -> should be unwrapped to 181 deg
+      expect(unwrapLongitude(-179, 179)).toBe(181);
+    });
+
+    it("should unwrap across the antimeridian going West", () => {
+      // Reference at -179 deg, next point at 179 deg -> should be unwrapped to -181 deg
+      expect(unwrapLongitude(179, -179)).toBe(-181);
+    });
+  });
+
   describe("intermediatePoint", () => {
     it("should return start point at f=0 and end point at f=1", () => {
       const p1: [number, number] = [139.6503, 35.6762];
@@ -100,6 +120,40 @@ describe("build-route utilities", () => {
     it("should create great circle arc for long distance", () => {
       const seg = buildGreatCircleSegment([139.65, 35.67], [2.35, 48.85], 0);
       expect(["LineString", "MultiLineString"]).toContain(seg.geometry.type);
+    });
+  });
+
+  describe("prepareSegments & buildOptimizedProgressRoute", () => {
+    it("should prepare segments once and return valid structures", () => {
+      const segs = prepareSegments(samplePlaces);
+      expect(segs).toHaveLength(2);
+      expect(segs[0].distanceKm).toBeGreaterThan(5000);
+      expect(segs[0].samples.length).toBeGreaterThan(50);
+      expect(segs[0].unwrappedSamples.length).toBe(segs[0].samples.length);
+    });
+
+    it("should build optimized progress routes identical to standard routes", () => {
+      const segs = prepareSegments(samplePlaces);
+
+      // Progress 0
+      const prog0 = buildOptimizedProgressRoute(segs, 0);
+      expect(prog0.completedGeoJson.features).toHaveLength(0);
+      expect(prog0.activeGeoJson.features).toHaveLength(0);
+
+      // Progress 0.5
+      const prog05 = buildOptimizedProgressRoute(segs, 0.5);
+      expect(prog05.completedGeoJson.features).toHaveLength(0);
+      expect(prog05.activeGeoJson.features).toHaveLength(1);
+
+      // Progress 1.0
+      const prog1 = buildOptimizedProgressRoute(segs, 1.0);
+      expect(prog1.completedGeoJson.features).toHaveLength(1);
+      expect(prog1.activeGeoJson.features).toHaveLength(0);
+
+      // Progress 2.0 (final)
+      const prog2 = buildOptimizedProgressRoute(segs, 2.0);
+      expect(prog2.completedGeoJson.features).toHaveLength(2);
+      expect(prog2.activeGeoJson.features).toHaveLength(0);
     });
   });
 
@@ -252,7 +306,6 @@ describe("build-route utilities", () => {
       ];
       const [[minLng], [maxLng]] = getJourneyBounds(tokyoHonolulu);
       const span = maxLng - minLng;
-      // Shortest Pacific span is ~62.46 deg, NOT ~297.54 deg wrap across Europe
       expect(span).toBeLessThan(100);
       expect(span).toBeCloseTo(62.46, 1);
     });

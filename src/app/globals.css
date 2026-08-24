@@ -203,6 +203,10 @@ td em { color: #a0a7a2; font-style: normal; }
 .retry-map-btn { padding: 9px 16px; border: 0; border-radius: 8px; background: var(--green); color: white; font-size: 11px; font-weight: 800; cursor: pointer; transition: background 0.15s ease; }
 .retry-map-btn:hover { background: var(--green-dark); }
 
+/* Non-blocking Fallback Notice */
+.map-fallback-notice { position: absolute; top: 14px; left: 14px; max-width: calc(100% - 80px); display: flex; align-items: center; gap: 8px; padding: 7px 12px; border-radius: 8px; background: rgba(255, 253, 248, 0.92); border: 1px solid rgba(24, 48, 41, 0.16); box-shadow: 0 4px 12px rgba(24, 48, 41, 0.08); font-size: 11px; font-weight: 700; color: #436251; z-index: 10; backdrop-filter: blur(6px); }
+.map-fallback-notice .notice-icon { width: 15px; height: 15px; border-radius: 50%; background: var(--green); color: white; display: grid; place-items: center; font-size: 9px; font-weight: 800; flex-shrink: 0; }
+
 /* Markers */
 .journey-stop-marker { width: 26px; height: 26px; border-radius: 50%; background: #fffdf8; border: 2.5px solid var(--green); color: var(--ink); font-size: 11px; font-weight: 800; display: grid; place-items: center; box-shadow: 0 3px 8px rgba(0, 0, 0, 0.18); cursor: pointer; transition: transform 0.2s ease, background-color 0.2s ease, border-color 0.2s ease; user-select: none; }
 .journey-stop-marker:hover { transform: scale(1.18); z-index: 5; }
@@ -210,8 +214,8 @@ td em { color: #a0a7a2; font-style: normal; }
 .journey-stop-marker.target-destination { border-color: var(--orange); border-width: 3px; transform: scale(1.15); box-shadow: 0 0 0 4px rgba(223, 116, 67, 0.22); }
 .journey-stop-marker.active { background: var(--orange); border-color: #b55428; color: white; transform: scale(1.22); box-shadow: 0 0 0 5px rgba(223, 116, 67, 0.28); z-index: 10; }
 
-.traveler-marker-pin { position: relative; width: 32px; height: 32px; display: grid; place-items: center; pointer-events: none; }
-.traveler-avatar { width: 28px; height: 28px; border-radius: 50%; background: var(--orange); border: 2px solid white; display: grid; place-items: center; box-shadow: 0 4px 12px rgba(223, 116, 67, 0.45); }
+.traveler-marker-pin { position: relative; width: 36px; height: 36px; display: grid; place-items: center; pointer-events: none; z-index: 50; }
+.traveler-avatar { width: 30px; height: 30px; border-radius: 50%; background: var(--orange); border: 2.5px solid white; display: grid; place-items: center; box-shadow: 0 4px 14px rgba(223, 116, 67, 0.55), 0 2px 6px rgba(0, 0, 0, 0.25); }
 .traveler-pointer { display: grid; place-items: center; transition: transform 0.1s linear; }
 .traveler-pulse { position: absolute; inset: -4px; border-radius: 50%; background: rgba(223, 116, 67, 0.35); animation: traveler-pulse 1.8s ease-out infinite; }
 @keyframes traveler-pulse { 0% { transform: scale(0.6); opacity: 0.9; } 100% { transform: scale(1.6); opacity: 0; } }
